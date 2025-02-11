@@ -2,9 +2,9 @@ package com.example;
 
 import com.amazonaws.services.lambda.runtime.events.KafkaEvent;
 
-public interface ParserInterface {
+public interface ParserInterface<T> {
     /**
-     * Parse a single KafkaEventRecord into a Java object (the "model").
+     * Parse a single KafkaEventRecord into a typed model object T.
      */
-    Object parseRecord(KafkaEvent.KafkaEventRecord record) throws Exception;
+    T parseRecord(KafkaEvent.KafkaEventRecord record) throws Exception;
 }

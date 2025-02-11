@@ -2,62 +2,67 @@ package com.example;
 
 import com.amazonaws.services.lambda.runtime.Context;
 import com.amazonaws.services.lambda.runtime.RequestHandler;
-import com.amazonaws.services.lambda.runtime.LambdaLogger;
 import com.amazonaws.services.lambda.runtime.events.KafkaEvent;
-import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
+import lombok.extern.slf4j.Slf4j;
+import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient;
 
 import java.util.List;
 
+@Slf4j
 public class MainLambdaHandler implements RequestHandler<KafkaEvent, String> {
 
     @Override
     public String handleRequest(KafkaEvent event, Context context) {
-        LambdaLogger logger = context.getLogger();
+        if (event == null) {
+            log.warn("Received null event.");
+            return "No event data";
+        }
 
-        // 1. Load env config
+        // 1) Load config from environment
         EnvironmentConfig config = EnvironmentConfig.loadFromSystemEnv();
+        log.info("Loaded environment: {}", config);
 
-        // 2. Log event
-        logger.log("Received Kafka event: " + event);
+        // 2) Flatten the Kafka event
+        List<KafkaEvent.KafkaEventRecord> records = KafkaEventFlattener.flatten(event);
+        log.info("Flattened {} record(s).", records.size());
 
-        // 3. Flatten Kafka records
-        List<KafkaEvent.KafkaEventRecord> flatRecords = KafkaEventFlattener.flatten(event);
-        logger.log("Flattened " + flatRecords.size() + " record(s).");
+        // 3) Create the parser via factory
+        ParserInterface<?> parser = ParserFactory.createParser(config.getParserName());
+        log.info("Using parser: {}", config.getParserName());
 
-        // 4. Create parser (reflection)
-        RecordParser recordParser = new RecordParser(
-                config.getParserClassName(),
-                config.getModelClassName()
-        );
+        // 4) Create the DynamoDB async client + writer
+        DynamoDbAsyncClient ddbAsyncClient = DynamoDbAsyncClient.builder().build();
+        AsyncDynamoDbWriter writer = new AsyncDynamoDbWriter(ddbAsyncClient, config.getDynamoDbTableName());
 
-        // 5. DynamoDB writer
-        DynamoDbClient ddbClient = DynamoDbClient.builder().build();
-        DynamoDBWriter writer = new DynamoDBWriter(ddbClient, config, logger);
+        int parsedCount = 0;
 
-        // 6. For each record, parse (base64 decode + JSON) => Model => add to writer
-        int processedCount = 0;
-        for (KafkaEvent.KafkaEventRecord r : flatRecords) {
+        // 5) For each record, parse + prepare a write (unless DRY_RUN)
+        for (KafkaEvent.KafkaEventRecord r : records) {
             try {
-                Object modelObj = recordParser.parse(r);
-                writer.prepareWrite(modelObj);
-                processedCount++;
+                // parse
+                Object modelObj = parser.parseRecord(r);
+                if (modelObj != null) {
+                    log.debug("Parsed model: {}", modelObj);
+                    if (!config.isDryRun()) {
+                        writer.prepareWrite(modelObj);
+                    }
+                    parsedCount++;
+                }
             } catch (Exception e) {
-                logger.log("Error parsing record: " + e.getMessage());
+                log.error("Error parsing record offset={} partition={}: {}",
+                        r.getOffset(), r.getPartition(), e.getMessage(), e);
             }
         }
 
-        // 7. If dryRun==false, actually update DynamoDB; else skip
+        // 6) If not DRY_RUN, do asynchronous writes with concurrency checks
         if (!config.isDryRun()) {
-            logger.log("Executing conditional updates (max batch size: " + config.getMaxBatchSize() + ")");
-            writer.executeBatchWrites();
+            writer.executeAsyncWrites();
         } else {
-            logger.log("Dry run enabled, skipping DynamoDB writes.");
+            log.info("DRY_RUN=true, skipping DynamoDB writes.");
         }
 
-        String resultMsg = "Processed " + processedCount + " record(s). " +
-                           (config.isDryRun() ? "(DRY_RUN)" : "(DONE)");
-        logger.log(resultMsg);
-
-        return resultMsg;
+        String result = "Processed " + parsedCount + " record(s). (DRY_RUN=" + config.isDryRun() + ")";
+        log.info(result);
+        return result;
     }
 }
