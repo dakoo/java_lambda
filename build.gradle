@@ -24,6 +24,13 @@ dependencies {
     // Lombok
     compileOnly 'org.projectlombok:lombok:1.18.26'  // (or latest)
     annotationProcessor 'org.projectlombok:lombok:1.18.26'
+
+    // JUnit 5
+    testImplementation 'org.junit.jupiter:junit-jupiter-api:5.9.2'
+    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.9.2'
+
+    // If you want assertions or mocking (for example, Mockito)
+    // testImplementation 'org.mockito:mockito-core:5.2.0'
 }
 
 java {
@@ -40,4 +47,8 @@ shadowJar {
     archiveVersion.set("")
     archiveClassifier.set("")
     mergeServiceFiles()
+}
+
+tasks.withType(Test) {
+    useJUnitPlatform()
 }

@@ -33,3 +33,6 @@ can you let me know how to set up a java project for lambda and give the impleme
 # or if you have Gradle installed system-wide:
 gradle clean shadowJar
 
+
+# Test
+./gradlew test
