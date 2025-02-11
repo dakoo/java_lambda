@@ -1,0 +1,43 @@
+plugins {
+    id 'java'
+    id 'com.github.johnrengelman.shadow' version '8.1.1'
+}
+
+group 'com.example'
+version '1.0.0'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // AWS Lambda
+    implementation 'com.amazonaws:aws-lambda-java-core:1.2.2'
+    implementation 'com.amazonaws:aws-lambda-java-events:3.11.0'
+
+    // AWS SDK v2 for DynamoDB
+    implementation 'software.amazon.awssdk:dynamodb:2.20.15'
+
+    // Jackson for JSON
+    implementation 'com.fasterxml.jackson.core:jackson-databind:2.15.0'
+
+    // Lombok
+    compileOnly 'org.projectlombok:lombok:1.18.26'  // (or latest)
+    annotationProcessor 'org.projectlombok:lombok:1.18.26'
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_11
+    targetCompatibility = JavaVersion.VERSION_11
+}
+
+tasks.withType(JavaCompile) {
+    options.encoding = 'UTF-8'
+}
+
+shadowJar {
+    archiveBaseName.set("java-lambda-kafka-dynamodb")
+    archiveVersion.set("")
+    archiveClassifier.set("")
+    mergeServiceFiles()
+}
