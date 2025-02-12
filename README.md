@@ -34,8 +34,8 @@ Give me the full implementation
 - I already have a lot of model classes and hope to reuse them. 
 - If an attribute name is a Dynamodb's reserved keyword (defined at https://docs.aws.amazon.com/qldb/latest/developerguide/ql-reference.reserved.html), escape it when it's written to the dynamodb.
 - create a parser from the name of the class directly
-- Leave a log message at the end of the lambda function. It should display the total number of records, the total number of invalid records (discarded items during parsing), the total number of write failed records due to conditionalCheckFailedException, the total number of successfully written items. 
-- Display the latency between steps: Parsing, preparing write, batch writes. With the change, please give me updated class implementations.
+- 
+
 
 
 # Build

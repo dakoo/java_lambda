@@ -14,16 +14,18 @@ import java.util.*;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * Handles asynchronous writes to DynamoDB.
- * - Supports nested objects (DishOption, DishOpenHour) as JSON blobs.
- * - Uses reflection to dynamically extract fields.
- * - Applies conditional updates for versioning.
+ * Asynchronous DynamoDB writer that:
+ * - Reflects on a model object to build concurrency-based "fieldName_ver" logic.
+ * - ALWAYS aliases all field names in the UpdateExpression (prevents reserved keyword issues).
+ * - Dynamically detects whether the id field is a Number or String and formats it correctly.
+ * - **Handles nested objects (DishOption, DishOpenHour, etc.) as JSON blobs**.
  */
 @Slf4j
 @RequiredArgsConstructor
 public class AsyncDynamoDbWriter {
 
-    private static final ObjectMapper objectMapper = new ObjectMapper(); // ✅ JSON Serializer
+    private static final ObjectMapper objectMapper = new ObjectMapper(); // ✅ For JSON serialization
+
     private final DynamoDbAsyncClient dynamoDbAsyncClient;
     private final String tableName;
     private final List<Object> pendingModels = new ArrayList<>();
@@ -36,28 +38,29 @@ public class AsyncDynamoDbWriter {
 
     public void executeAsyncWrites() {
         if (pendingModels.isEmpty()) {
+            log.info("No models to write to DynamoDB.");
             return;
         }
 
-        List<CompletableFuture<UpdateItemResponse>> futures = new ArrayList<>();
+        log.info("Submitting {} model(s) asynchronously to DynamoDB...", pendingModels.size());
 
-        for (Object model : pendingModels) {
+        List<CompletableFuture<UpdateItemResponse>> futures = new ArrayList<>();
+        for (int i = 0; i < pendingModels.size(); i++) {
+            final int index = i;
+            Object model = pendingModels.get(i);
+
             CompletableFuture<UpdateItemResponse> future =
                     doConditionalUpdateAsync(model)
                             .exceptionally(ex -> {
-                                if (ex.getCause() instanceof ConditionalCheckFailedException) {
-                                    log.warn("Conditional update failed: {}", ex.getMessage());
-                                    return null;
-                                } else {
-                                    log.error("Async update failed: {}", ex.getMessage(), ex);
-                                    return null;
-                                }
+                                log.error("Async update failed for item index={}, error={}", index, ex.getMessage(), ex);
+                                return null;
                             });
 
             futures.add(future);
         }
 
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+        log.info("All asynchronous DynamoDB writes completed.");
         pendingModels.clear();
     }
 
@@ -74,17 +77,17 @@ public class AsyncDynamoDbWriter {
             }
 
             UpdateItemRequest request = buildUpdateRequest(idVer.getIdValue(), idVer.isIdNumeric(), expr);
+            log.debug("DynamoDB update: key={}, updateExpr='{}', condition='{}', EAN={}, EAV={}",
+                    idVer.getIdValue(), expr.updateExpr, expr.conditionExpr, expr.ean, expr.eav);
+
             return dynamoDbAsyncClient.updateItem(request);
 
         } catch (NoSuchFieldException | IllegalAccessException ex) {
-            log.error("Reflection error: {}", ex.getMessage(), ex);
+            log.error("Reflection error in doConditionalUpdateAsync: {}", ex.getMessage(), ex);
             return CompletableFuture.completedFuture(null);
         }
     }
 
-    /**
-     * ✅ Extracts 'id' and 'version' fields dynamically, supporting both Long and String IDs.
-     */
     private IdVersionResult extractIdAndVersion(Object modelObj)
             throws NoSuchFieldException, IllegalAccessException {
 
@@ -108,33 +111,6 @@ public class AsyncDynamoDbWriter {
         return new IdVersionResult(idVal.toString(), isNumeric, incomingVersion);
     }
 
-    /**
-     * ✅ Builds the DynamoDB UpdateItemRequest dynamically.
-     */
-    private UpdateItemRequest buildUpdateRequest(String idVal, boolean isIdNumeric, ReflectionExpressions expr) {
-        Map<String, AttributeValue> key = Collections.singletonMap(
-                "id", isIdNumeric ? AttributeValue.builder().n(idVal).build()
-                        : AttributeValue.builder().s(idVal).build()
-        );
-
-        UpdateItemRequest.Builder requestBuilder = UpdateItemRequest.builder()
-                .tableName(tableName)
-                .key(key)
-                .updateExpression(expr.updateExpr)
-                .conditionExpression(expr.conditionExpr)
-                .expressionAttributeValues(expr.eav);
-
-        if (!expr.ean.isEmpty()) {
-            requestBuilder.expressionAttributeNames(expr.ean);
-        }
-
-        return requestBuilder.build();
-    }
-
-    /**
-     * ✅ Builds the UpdateExpression and ConditionExpression.
-     * - Serializes nested objects and collections to JSON.
-     */
     private ReflectionExpressions buildUpdateAndConditionExpressions(Object modelObj, long incomingVersion)
             throws IllegalAccessException {
 
@@ -160,6 +136,7 @@ public class AsyncDynamoDbWriter {
                 continue;
             }
 
+            // ✅ Convert nested objects & collections to JSON before storing
             String serializedValue = serializeToJson(fieldValue);
 
             String alias = "#r_" + fieldName;
@@ -180,20 +157,41 @@ public class AsyncDynamoDbWriter {
         }
 
         if (conditions.isEmpty()) {
+            log.debug("No updatable fields for class={}, skipping", clazz.getSimpleName());
             return null;
         }
 
         return new ReflectionExpressions(updateExpr.toString(), String.join(" AND ", conditions), eav, ean);
     }
 
+    private UpdateItemRequest buildUpdateRequest(String idVal, boolean isIdNumeric, ReflectionExpressions expr) {
+        Map<String, AttributeValue> key = Collections.singletonMap(
+                "id", isIdNumeric ? AttributeValue.builder().n(idVal).build()
+                        : AttributeValue.builder().s(idVal).build()
+        );
+
+        UpdateItemRequest.Builder requestBuilder = UpdateItemRequest.builder()
+                .tableName(tableName)
+                .key(key)
+                .updateExpression(expr.updateExpr)
+                .conditionExpression(expr.conditionExpr)
+                .expressionAttributeValues(expr.eav);
+
+        if (!expr.ean.isEmpty()) {
+            requestBuilder.expressionAttributeNames(expr.ean);
+        }
+
+        return requestBuilder.build();
+    }
+
     /**
-     * ✅ Converts nested objects and collections to JSON before storing in DynamoDB.
+     * ✅ Converts nested objects & collections to JSON for DynamoDB storage.
      */
     private String serializeToJson(Object val) {
         try {
             return objectMapper.writeValueAsString(val);
         } catch (JsonProcessingException e) {
-            log.error("JSON serialization failed: {}", val, e);
+            log.error("JSON serialization failed for value: {}", val, e);
             return "{}"; // Return empty JSON if serialization fails
         }
     }
