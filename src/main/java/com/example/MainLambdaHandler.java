@@ -36,7 +36,7 @@ public class MainLambdaHandler implements RequestHandler<KafkaEvent, String> {
         }
 
         try {
-            String jsonEvent = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(event);
+            String jsonEvent = objectMapper.writeValueAsString(event);
             log.info("Received Lambda Event:\n" + jsonEvent + "\n");
         } catch (Exception e) {
             String message = "Failed to serialize event to JSON: " + e.getMessage();
