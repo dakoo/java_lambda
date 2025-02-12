@@ -9,48 +9,41 @@ import java.util.*;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * Demonstrates async conditional writes with concurrency checks
- * and also escapes DynamoDB reserved keywords using expression attribute names.
+ * Asynchronous DynamoDB writer that:
+ * 1) Reflects on a model object to build concurrency-based "fieldName_ver" logic.
+ * 2) ALWAYS aliases all field names in the UpdateExpression (no reserved word checks).
+ *    i.e. "SET #r_fieldName = :val, #r_fieldName_ver = :incomingVersion"
+ *         and condition => "(attribute_not_exists(#r_fieldName_ver) OR #r_fieldName_ver < :incomingVersion)"
+ *    This ensures no collisions with DynamoDB reserved keywords, since we always use an alias.
  *
- * The doConditionalUpdateAsync method is refactored into smaller helper methods
- * for clarity and maintainability.
+ * The doConditionalUpdateAsync method is refactored into smaller helpers for readability.
  */
 @Slf4j
 public class AsyncDynamoDbWriter {
 
     private final DynamoDbAsyncClient dynamoDbAsyncClient;
     private final String tableName;
-    private final List<Object> pendingModels = new ArrayList<>();
 
-    // Example subset of DynamoDB reserved words for demonstration.
-    // In production, you should use the complete list if needed.
-    private static final Set<String> DYNAMODB_RESERVED_WORDS = Set.of(
-            "ABORT","ADD","ALL","ALTER","AND","ANY","AS","ASC","AUTHORIZATION",
-            "BATCH","BEGIN","BETWEEN","BIGINT","BINARY","BLOB","BOOLEAN","BY","CASE",
-            "CAST","CHAR","COLUMN","COMMIT","COMPARE","CONSISTENCY","CREATE","CROSS","CURRENT_DATE",
-            "CURRENT_TIME","CURRENT_TIMESTAMP","CURRENT_USER","DELETE","DESC","DISTINCT",
-            "DOUBLE","DROP","EACH","ELSE","END","ESCAPE","EXISTS","FALSE","FLOAT","FOR",
-            "FROM","FULL","FUNCTION","GLOB","GROUP","HAVING","IF","IN","INDEX","INNER",
-            "INSERT","INT","INTEGER","INTO","IS","ITEM","JOIN","KEY","LEFT","LIKE","LIMIT",
-            "LOCK","LONG","MATCH","MERGE","NATURAL","NO","NOT","NULL","NUMBER","NUMERIC",
-            "OF","ON","ONLY","OR","ORDER","OUTER","OVER","PARTITION","PRIMARY","RANGE",
-            "REAL","RECORD","RELEASE","REPLACE","RIGHT","ROLE","ROLLUP","SELECT","SET",
-            "SHOW","SIMILAR","SMALLINT","SOME","START","SUBSTRING","TABLE","THEN","TIME",
-            "TIMESTAMP","TO","TRUE","UPDATE","USAGE","USER","USING","VALUES","VARCHAR",
-            "VIEW","WHEN","WHERE","WITH"
-    );
+    // We accumulate model objects here
+    private final List<Object> pendingModels = new ArrayList<>();
 
     public AsyncDynamoDbWriter(DynamoDbAsyncClient client, String tableName) {
         this.dynamoDbAsyncClient = client;
         this.tableName = tableName;
     }
 
+    /**
+     * Accumulate model objects for later writing.
+     */
     public void prepareWrite(Object modelObj) {
         if (modelObj != null) {
             pendingModels.add(modelObj);
         }
     }
 
+    /**
+     * Perform concurrency-protected updates for all pending models in parallel (async).
+     */
     public void executeAsyncWrites() {
         if (pendingModels.isEmpty()) {
             log.info("No models to write to DynamoDB.");
@@ -75,39 +68,35 @@ public class AsyncDynamoDbWriter {
         }
 
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-        log.info("All asynchronous writes completed.");
+        log.info("All asynchronous DynamoDB writes completed.");
         pendingModels.clear();
     }
 
     /**
-     * Orchestrates reflection-based concurrency checks for a single model object.
-     *  - Finds 'id' and 'version' fields.
-     *  - Builds UpdateItemRequest with "fieldName = :val, fieldName_ver = :incomingVersion"
-     *  - Condition: "(attribute_not_exists(#aliasForFieldName_ver) OR #aliasForFieldName_ver < :incomingVersion)" for each field
-     *  - Escapes reserved keywords with ExpressionAttributeNames
+     * Reflect on 'id' + 'version' fields, build a concurrency-based UpdateItemRequest,
+     * aliasing all field names in the expression.
      */
     private CompletableFuture<UpdateItemResponse> doConditionalUpdateAsync(Object modelObj) {
         try {
-            // 1) Extract partition key (id) and version
+            // 1) Extract 'id' and 'version'
             IdVersionResult idVer = extractIdAndVersion(modelObj);
             if (idVer == null) {
                 return CompletableFuture.completedFuture(null);
             }
 
-            // 2) Reflect on the object's other fields => build expressions
+            // 2) Build reflection-based expressions for the other fields
             ReflectionExpressions expr = buildUpdateAndConditionExpressions(modelObj, idVer.getIncomingVersion());
-
-            // 3) If nothing to update, skip
             if (expr == null) {
+                // means no fields to update
                 return CompletableFuture.completedFuture(null);
             }
 
-            // 4) Build the final UpdateItemRequest
+            // 3) Build final request
             UpdateItemRequest request = buildUpdateRequest(idVer.getIdVal(), expr);
             log.debug("DynamoDB update: key={}, updateExpr='{}', condition='{}', EAN={}, EAV={}",
                     idVer.getIdVal(), expr.updateExpr, expr.conditionExpr, expr.ean, expr.eav);
 
-            // 5) Execute asynchronously
+            // 4) Execute the async call
             return dynamoDbAsyncClient.updateItem(request);
 
         } catch (NoSuchFieldException | IllegalAccessException ex) {
@@ -117,7 +106,8 @@ public class AsyncDynamoDbWriter {
     }
 
     /**
-     * Attempts to extract the 'id' and 'version' fields via reflection, returning them in an object.
+     * Helper to extract 'id' + 'version' fields via reflection.
+     * Return them in an object, or null if missing.
      */
     private IdVersionResult extractIdAndVersion(Object modelObj)
             throws NoSuchFieldException, IllegalAccessException {
@@ -136,16 +126,15 @@ public class AsyncDynamoDbWriter {
             return null;
         }
 
-        // We'll cast 'version' to a long
         long incomingVersion = ((Number) verVal).longValue();
         return new IdVersionResult(idVal.toString(), incomingVersion);
     }
 
     /**
-     * Reflect on all fields except 'id'/'version'. For each field F:
-     *  - Add "F = :FVal, F_ver = :incomingVersion" to updateExpr
-     *  - Add condition => "(attribute_not_exists(#aliasForF_ver) OR #aliasForF_ver < :incomingVersion)"
-     *  - Store EAN if needed
+     * Reflect on all fields except 'id'/'version', always aliasing them as #r_fieldName.
+     * Build:
+     *   updateExpr => "SET #r_fieldName = :val, #r_fieldName_ver = :incomingVersion"
+     *   conditionExpr => "(attribute_not_exists(#r_fieldName_ver) OR #r_fieldName_ver < :incomingVersion)" AND ...
      */
     private ReflectionExpressions buildUpdateAndConditionExpressions(Object modelObj, long incomingVersion)
             throws IllegalAccessException {
@@ -158,7 +147,7 @@ public class AsyncDynamoDbWriter {
         Map<String, AttributeValue> eav = new HashMap<>();
         Map<String, String> ean = new HashMap<>();
 
-        // Add version in eav
+        // We store the version in the EAV
         eav.put(":incomingVersion", AttributeValue.builder().n(Long.toString(incomingVersion)).build());
 
         boolean firstSet = true;
@@ -166,44 +155,46 @@ public class AsyncDynamoDbWriter {
         for (Field f : allFields) {
             f.setAccessible(true);
             String fieldName = f.getName();
-            // skip id/version
             if ("id".equals(fieldName) || "version".equals(fieldName)) {
                 continue;
             }
 
             Object fieldValue = f.get(modelObj);
             if (fieldValue == null) {
-                // skip null fields
                 continue;
             }
 
-            // Possibly escape reserved keyword
-            String escapedFieldName = escapeReserved(fieldName, ean);
-            // for the "ver" column as well
-            String versionedName = fieldName + "_ver";
-            String escapedVersionedName = escapeReserved(versionedName, ean);
+            // Always alias => #r_fieldName
+            String alias = "#r_" + fieldName;
+            ean.put(alias, fieldName);
 
-            // add the field placeholder
+            // Also alias <fieldName>_ver => #r_fieldName_ver
+            String verName = fieldName + "_ver";
+            String verAlias = "#r_" + verName;
+            ean.put(verAlias, verName);
+
+            // e.g. :fieldName
             String placeholder = ":" + fieldName;
             eav.put(placeholder, toAttributeValue(fieldValue));
 
+            // Append to update expression
             if (!firstSet) {
                 updateExpr.append(", ");
             }
-            // e.g. "#r_name = :name, #r_name_ver = :incomingVersion"
-            updateExpr.append(escapedFieldName).append(" = ").append(placeholder)
-                    .append(", ").append(escapedVersionedName).append(" = :incomingVersion");
+            updateExpr.append(alias).append(" = ").append(placeholder)
+                    .append(", ").append(verAlias).append(" = :incomingVersion");
             firstSet = false;
 
-            // condition => "(attribute_not_exists(#r_name_ver) OR #r_name_ver < :incomingVersion)"
-            String cond = "(attribute_not_exists(" + escapedVersionedName + ") OR "
-                    + escapedVersionedName + " < :incomingVersion)";
+            // condition => "(attribute_not_exists(#r_fieldName_ver) OR #r_fieldName_ver < :incomingVersion)"
+            String cond = "(attribute_not_exists(" + verAlias + ") OR "
+                    + verAlias + " < :incomingVersion)";
             conditions.add(cond);
         }
 
         if (firstSet) {
-            log.debug("No updatable fields found for object of class={} => skip", clazz.getSimpleName());
-            return null; // means we have nothing to update
+            // no fields to update
+            log.debug("No updatable fields for class={}, skipping", clazz.getSimpleName());
+            return null;
         }
 
         ReflectionExpressions expr = new ReflectionExpressions();
@@ -216,11 +207,10 @@ public class AsyncDynamoDbWriter {
     }
 
     /**
-     * Build the final UpdateItemRequest from the reflection expressions + key ID.
-     * Conditionally set expressionAttributeNames only if ean is non-empty.
+     * Build the final UpdateItemRequest, conditionally adding expressionAttributeNames
+     * only if ean is non-empty.
      */
     private UpdateItemRequest buildUpdateRequest(String idVal, ReflectionExpressions expr) {
-        // Build the key
         Map<String, AttributeValue> key = Collections.singletonMap(
                 "id", AttributeValue.builder().s(idVal).build()
         );
@@ -232,26 +222,13 @@ public class AsyncDynamoDbWriter {
                 .conditionExpression(expr.conditionExpr)
                 .expressionAttributeValues(expr.eav);
 
-        // only set EAN if not empty
+        // If for some reason the model had no aliasing needed, ean might be empty,
+        // but in this approach we always alias fields, so it should rarely be empty.
         if (!expr.ean.isEmpty()) {
             requestBuilder.expressionAttributeNames(expr.ean);
         }
 
         return requestBuilder.build();
-    }
-
-    /**
-     * Checks if fieldName is reserved (based on static set), and if so, returns #alias.
-     * Otherwise returns the original fieldName. Also populates EAN if an alias is used.
-     */
-    private String escapeReserved(String fieldName, Map<String, String> ean) {
-        String upper = fieldName.toUpperCase();
-        if (DYNAMODB_RESERVED_WORDS.contains(upper)) {
-            String alias = "#r_" + fieldName;
-            ean.put(alias, fieldName);
-            return alias;
-        }
-        return fieldName; // no alias needed
     }
 
     private AttributeValue toAttributeValue(Object val) {
@@ -262,7 +239,7 @@ public class AsyncDynamoDbWriter {
     }
 
     /**
-     * A small struct-like class to store 'id' + 'version' from reflection.
+     * Stores 'idVal' as a string and 'incomingVersion' as long.
      */
     private static class IdVersionResult {
         private final String idVal;
@@ -278,13 +255,12 @@ public class AsyncDynamoDbWriter {
     }
 
     /**
-     * A small struct to store the results of building the reflection-based
-     * update expression, condition expression, attribute values, and names.
+     * A small structure to hold reflection-based results.
      */
     private static class ReflectionExpressions {
-        String updateExpr;
-        String conditionExpr;
-        Map<String, AttributeValue> eav;
-        Map<String, String> ean;
+        String updateExpr;        // The final SET expression
+        String conditionExpr;     // The final condition expression
+        Map<String, AttributeValue> eav;  // Expression attribute values
+        Map<String, String> ean;          // Expression attribute names
     }
 }
