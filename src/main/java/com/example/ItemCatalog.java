@@ -14,10 +14,10 @@ import java.util.Map;
 @NoArgsConstructor
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class ItemCatalog {
-    @VersionKey
-    private Long version;
     @PartitionKey
     private Long itemId;
+    @VersionKey
+    private Long version;
     private Long productId;
     private String divisionType;
     private Map<String, String> name;
