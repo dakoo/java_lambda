@@ -31,7 +31,12 @@ can you let me know how to set up a java project for lambda and give the impleme
 
 Give me the full implementation
 
-I already have a lot of model classes and hope to reuse them. 
+- I already have a lot of model classes and hope to reuse them. 
+- If an attribute name is a Dynamodb's reserved keyword (defined at https://docs.aws.amazon.com/qldb/latest/developerguide/ql-reference.reserved.html), escape it when it's written to the dynamodb.
+- create a parser from the name of the class directly
+- 
+
+
 
 # Build
 
