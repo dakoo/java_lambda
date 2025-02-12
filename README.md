@@ -50,4 +50,4 @@ gradle clean shadowJar
 make build
 
 ## 2) Deploy to your Lambda function
-make deploy LAMBDA_FUNCTION_NAME=my-lambda-func REGION=us-east-1
+make deploy PROFILE=dev LAMBDA_FUNCTION_NAME=common_data_service_poc

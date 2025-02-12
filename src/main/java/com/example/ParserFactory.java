@@ -1,18 +1,23 @@
 package com.example;
 
 public class ParserFactory {
-    public static ParserInterface<?> createParser(String parserName) {
-        switch (parserName) {
-            case "DishParser":
-                // returns a parser that decodes base64 -> JSON -> Dish
-                return new DishJsonBase64Parser();
 
-            // Example: if you have another model "Drink", you might do:
-            // case "DrinkParser":
-            //     return new DrinkJsonBase64Parser();
+    /**
+     * Given the fully qualified class name of a parser (that implements ParserInterface<?>),
+     * use reflection to instantiate it.
+     */
+    public static ParserInterface<?> createParser(String parserClassName) {
+        try {
+            Class<?> parserClass = Class.forName(parserClassName);
+            Object parserInstance = parserClass.getDeclaredConstructor().newInstance();
 
-            default:
-                throw new IllegalArgumentException("Unknown parserName: " + parserName);
+            // Cast to ParserInterface<?> so we can return it
+            return (ParserInterface<?>) parserInstance;
+
+        } catch (ClassNotFoundException e) {
+            throw new IllegalArgumentException("Parser class not found: " + parserClassName, e);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to instantiate parser: " + parserClassName, e);
         }
     }
 }
