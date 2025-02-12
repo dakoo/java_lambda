@@ -13,13 +13,19 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class MainLambdaHandler implements RequestHandler<KafkaEvent, String> {
 
     // ✅ Counters for tracking execution results
-    private final AtomicInteger totalRecords = new AtomicInteger(0);
-    private final AtomicInteger successfulWrites = new AtomicInteger(0);
-    private final AtomicInteger conditionalCheckFailedCount = new AtomicInteger(0);
-    private final AtomicInteger otherFailedWrites = new AtomicInteger(0);
+    private final AtomicInteger totalRecords = new AtomicInteger();
+    private final AtomicInteger successfulWrites = new AtomicInteger();
+    private final AtomicInteger conditionalCheckFailedCount = new AtomicInteger();
+    private final AtomicInteger otherFailedWrites = new AtomicInteger();
 
     @Override
     public String handleRequest(KafkaEvent event, Context context) {
+        // ✅ Reset counters for the new invocation
+        totalRecords.set(0);
+        successfulWrites.set(0);
+        conditionalCheckFailedCount.set(0);
+        otherFailedWrites.set(0);
+
         if (event == null) {
             log.warn("Received null event.");
             return "No event data";
