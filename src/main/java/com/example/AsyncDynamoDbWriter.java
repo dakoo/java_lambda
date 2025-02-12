@@ -71,7 +71,8 @@ public class AsyncDynamoDbWriter {
                 return CompletableFuture.completedFuture(null);
             }
 
-            ReflectionExpressions expr = buildUpdateAndConditionExpressions(modelObj, idVer.getIncomingVersion(), idVer.getVersionKey());
+            // ✅ Pass partitionKey to exclude it from updates
+            ReflectionExpressions expr = buildUpdateAndConditionExpressions(modelObj, idVer.getIncomingVersion(), idVer.getVersionKey(), idVer.getPartitionKey());
             if (expr == null) {
                 return CompletableFuture.completedFuture(null);
             }
@@ -153,11 +154,7 @@ public class AsyncDynamoDbWriter {
         return requestBuilder.build();
     }
 
-    /**
-     * ✅ Builds the UpdateExpression and ConditionExpression.
-     * - Serializes nested objects and collections to JSON.
-     */
-    private ReflectionExpressions buildUpdateAndConditionExpressions(Object modelObj, long incomingVersion, String versionKey)
+    private ReflectionExpressions buildUpdateAndConditionExpressions(Object modelObj, long incomingVersion, String versionKey, String partitionKey)
             throws IllegalAccessException {
 
         Class<?> clazz = modelObj.getClass();
@@ -173,7 +170,9 @@ public class AsyncDynamoDbWriter {
         for (Field f : allFields) {
             f.setAccessible(true);
             String fieldName = f.getName();
-            if (fieldName.equals(versionKey)) {
+
+            // ✅ Skip partition key to avoid DynamoDB error
+            if (fieldName.equals(versionKey) || fieldName.equals(partitionKey)) {
                 continue;
             }
 
@@ -207,6 +206,7 @@ public class AsyncDynamoDbWriter {
 
         return new ReflectionExpressions(updateExpr.toString(), String.join(" AND ", conditions), eav, ean);
     }
+
 
     /**
      * ✅ Converts nested objects and collections to JSON before storing in DynamoDB.
