@@ -6,11 +6,8 @@ import lombok.*;
 import java.util.List;
 import java.util.Map;
 
-@Getter
-@Setter
-@Builder
+@Data
 @NoArgsConstructor
-@AllArgsConstructor
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class DishOption {
     private Long id;

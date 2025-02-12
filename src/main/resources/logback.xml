@@ -1,6 +1,6 @@
 <configuration>
     <!-- Example: set root logger level to DEBUG for more verbosity -->
-    <root level="DEBUG">
+    <root level="INFO">
         <appender-ref ref="STDOUT"/>
     </root>
 

@@ -1,10 +1,7 @@
 package com.example;
 
 import com.amazonaws.services.lambda.runtime.events.KafkaEvent;
-import com.example.ParserInterface;
 import com.example.model.ItemCatalog;
-import com.example.ItemCatalogDTO; // Your Avro-generated class
-import com.example.AvroSpecificRecordSerializer; // Hypothetical serializer
 import lombok.extern.slf4j.Slf4j;
 
 import java.nio.charset.StandardCharsets;
@@ -21,8 +18,8 @@ public class ItemCatalogParser implements ParserInterface<ItemCatalog> {
 
     private final AvroSpecificRecordSerializer serializer;
 
-    public ItemCatalogParser(AvroSpecificRecordSerializer serializer) {
-        this.serializer = serializer;
+    public ItemCatalogParser() {
+        this.serializer = new AvroSpecificRecordSerializer();
     }
 
     @Override
@@ -40,13 +37,14 @@ public class ItemCatalogParser implements ParserInterface<ItemCatalog> {
 
         // 3) Convert Avro DTO -> ItemCatalog
         ItemCatalog model = new ItemCatalog();
+        model.setItemId(dto.getItemId());
         model.setVersion(dto.getVersion());
         model.setProductId(dto.getProductId());
         model.setDivisionType(dto.getDivisionType());
         model.setName(dto.getName());
         model.setReconciledAttributes(dto.getReconciledAttributes());
         model.setValid(dto.getValid());
-        model.setCreateAt(dto.getCreateAt());
+        model.setCreatedAt(dto.getCreatedAt());
         model.setSequence(dto.getSequence());
         model.setMainImage(dto.getMainImage());
 
