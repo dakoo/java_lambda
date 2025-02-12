@@ -1,7 +1,7 @@
 package com.example;
 
 import com.amazonaws.services.lambda.runtime.events.KafkaEvent;
-import com.example.model.ItemCatalog;
+import com.example.ItemCatalog;
 import lombok.extern.slf4j.Slf4j;
 
 import java.nio.charset.StandardCharsets;
@@ -38,7 +38,7 @@ public class ItemCatalogParser implements ParserInterface<ItemCatalog> {
         // 3) Convert Avro DTO -> ItemCatalog
         ItemCatalog model = new ItemCatalog();
         model.setItemId(dto.getItemId());
-        model.setVersion(dto.getVersion());
+        model.setVersion(dto.getSequence());
         model.setProductId(dto.getProductId());
         model.setDivisionType(dto.getDivisionType());
         model.setName(dto.getName());

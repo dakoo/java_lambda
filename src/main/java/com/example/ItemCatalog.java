@@ -1,4 +1,4 @@
-package com.example.model;
+package com.example;
 
 import com.example.annotations.PartitionKey;
 import com.example.annotations.VersionKey;
