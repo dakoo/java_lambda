@@ -1,5 +1,8 @@
 package com.example;
 
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient;
 import software.amazon.awssdk.services.dynamodb.model.*;
@@ -10,21 +13,17 @@ import java.util.concurrent.CompletableFuture;
 
 /**
  * Asynchronous DynamoDB writer that:
- * 1) Reflects on a model object to build concurrency-based "fieldName_ver" logic.
- * 2) ALWAYS aliases all field names in the UpdateExpression (no reserved word checks).
- * 3) Dynamically detects the id field type (Number or String) and formats it correctly.
+ * - Reflects on a model object to build concurrency-based "fieldName_ver" logic.
+ * - ALWAYS aliases all field names in the UpdateExpression (prevents reserved keyword issues).
+ * - Dynamically detects whether the id field is a Number or String and formats it correctly.
  */
 @Slf4j
+@RequiredArgsConstructor
 public class AsyncDynamoDbWriter {
 
     private final DynamoDbAsyncClient dynamoDbAsyncClient;
     private final String tableName;
     private final List<Object> pendingModels = new ArrayList<>();
-
-    public AsyncDynamoDbWriter(DynamoDbAsyncClient client, String tableName) {
-        this.dynamoDbAsyncClient = client;
-        this.tableName = tableName;
-    }
 
     public void prepareWrite(Object modelObj) {
         if (modelObj != null) {
@@ -107,28 +106,18 @@ public class AsyncDynamoDbWriter {
         return new IdVersionResult(idVal.toString(), isNumeric, incomingVersion);
     }
 
-    /**
-     * ✅ **Missing method added: buildUpdateAndConditionExpressions()**
-     *
-     * Builds:
-     * - updateExpr → `"SET #r_field = :val, #r_field_ver = :incomingVersion"`
-     * - conditionExpr → `"attribute_not_exists(#r_field_ver) OR #r_field_ver < :incomingVersion"`
-     * - Always aliases field names as `#r_field`
-     */
     private ReflectionExpressions buildUpdateAndConditionExpressions(Object modelObj, long incomingVersion)
             throws IllegalAccessException {
 
         Class<?> clazz = modelObj.getClass();
         Field[] allFields = clazz.getDeclaredFields();
 
-        StringBuilder updateExpr = new StringBuilder("SET ");
+        StringBuilder updateExpr = new StringBuilder("SET version = :incomingVersion");  // ✅ Ensure version is updated
         List<String> conditions = new ArrayList<>();
         Map<String, AttributeValue> eav = new HashMap<>();
         Map<String, String> ean = new HashMap<>();
 
         eav.put(":incomingVersion", AttributeValue.builder().n(Long.toString(incomingVersion)).build());
-
-        boolean firstSet = true;
 
         for (Field f : allFields) {
             f.setAccessible(true);
@@ -152,29 +141,19 @@ public class AsyncDynamoDbWriter {
             String placeholder = ":" + fieldName;
             eav.put(placeholder, toAttributeValue(fieldValue));
 
-            if (!firstSet) {
-                updateExpr.append(", ");
-            }
-            updateExpr.append(alias).append(" = ").append(placeholder)
+            updateExpr.append(", ").append(alias).append(" = ").append(placeholder)
                     .append(", ").append(verAlias).append(" = :incomingVersion");
-            firstSet = false;
 
             String cond = "(attribute_not_exists(" + verAlias + ") OR " + verAlias + " < :incomingVersion)";
             conditions.add(cond);
         }
 
-        if (firstSet) {
+        if (conditions.isEmpty()) {
             log.debug("No updatable fields for class={}, skipping", clazz.getSimpleName());
             return null;
         }
 
-        ReflectionExpressions expr = new ReflectionExpressions();
-        expr.updateExpr = updateExpr.toString();
-        expr.conditionExpr = String.join(" AND ", conditions);
-        expr.eav = eav;
-        expr.ean = ean;
-
-        return expr;
+        return new ReflectionExpressions(updateExpr.toString(), String.join(" AND ", conditions), eav, ean);
     }
 
     private UpdateItemRequest buildUpdateRequest(String idVal, boolean isIdNumeric, ReflectionExpressions expr) {
@@ -204,26 +183,20 @@ public class AsyncDynamoDbWriter {
         return AttributeValue.builder().s(val.toString()).build();
     }
 
+    @Getter
+    @AllArgsConstructor
     private static class IdVersionResult {
         private final String idValue;
         private final boolean isIdNumeric;
         private final long incomingVersion;
-
-        public IdVersionResult(String idValue, boolean isIdNumeric, long incomingVersion) {
-            this.idValue = idValue;
-            this.isIdNumeric = isIdNumeric;
-            this.incomingVersion = incomingVersion;
-        }
-
-        public String getIdValue() { return idValue; }
-        public boolean isIdNumeric() { return isIdNumeric; }
-        public long getIncomingVersion() { return incomingVersion; }
     }
 
+    @Getter
+    @AllArgsConstructor
     private static class ReflectionExpressions {
-        String updateExpr;
-        String conditionExpr;
-        Map<String, AttributeValue> eav;
-        Map<String, String> ean;
+        private final String updateExpr;
+        private final String conditionExpr;
+        private final Map<String, AttributeValue> eav;
+        private final Map<String, String> ean;
     }
 }
