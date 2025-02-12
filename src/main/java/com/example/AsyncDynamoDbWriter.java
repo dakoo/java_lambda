@@ -1,5 +1,7 @@
 package com.example;
 
+import com.example.annotations.PartitionKey;
+import com.example.annotations.VersionKey;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.AllArgsConstructor;
@@ -14,18 +16,17 @@ import java.util.*;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * Asynchronous DynamoDB writer that:
- * - Reflects on a model object to build concurrency-based "fieldName_ver" logic.
- * - ALWAYS aliases all field names in the UpdateExpression (prevents reserved keyword issues).
- * - Dynamically detects whether the id field is a Number or String and formats it correctly.
- * - **Handles nested objects (DishOption, DishOpenHour, etc.) as JSON blobs**.
+ * Handles asynchronous writes to DynamoDB.
+ * - Supports dynamic partition key and version key using annotations.
+ * - Supports nested objects (DishOption, DishOpenHour) as JSON blobs.
+ * - Uses reflection to dynamically extract fields.
+ * - Applies conditional updates for versioning.
  */
 @Slf4j
 @RequiredArgsConstructor
 public class AsyncDynamoDbWriter {
 
-    private static final ObjectMapper objectMapper = new ObjectMapper(); // ✅ For JSON serialization
-
+    private static final ObjectMapper objectMapper = new ObjectMapper(); // ✅ JSON Serializer
     private final DynamoDbAsyncClient dynamoDbAsyncClient;
     private final String tableName;
     private final List<Object> pendingModels = new ArrayList<>();
@@ -38,29 +39,28 @@ public class AsyncDynamoDbWriter {
 
     public void executeAsyncWrites() {
         if (pendingModels.isEmpty()) {
-            log.info("No models to write to DynamoDB.");
             return;
         }
 
-        log.info("Submitting {} model(s) asynchronously to DynamoDB...", pendingModels.size());
-
         List<CompletableFuture<UpdateItemResponse>> futures = new ArrayList<>();
-        for (int i = 0; i < pendingModels.size(); i++) {
-            final int index = i;
-            Object model = pendingModels.get(i);
 
+        for (Object model : pendingModels) {
             CompletableFuture<UpdateItemResponse> future =
                     doConditionalUpdateAsync(model)
                             .exceptionally(ex -> {
-                                log.error("Async update failed for item index={}, error={}", index, ex.getMessage(), ex);
-                                return null;
+                                if (ex.getCause() instanceof ConditionalCheckFailedException) {
+                                    log.warn("Conditional update failed: {}", ex.getMessage());
+                                    return null;
+                                } else {
+                                    log.error("Async update failed: {}", ex.getMessage(), ex);
+                                    return null;
+                                }
                             });
 
             futures.add(future);
         }
 
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-        log.info("All asynchronous DynamoDB writes completed.");
         pendingModels.clear();
     }
 
@@ -71,29 +71,47 @@ public class AsyncDynamoDbWriter {
                 return CompletableFuture.completedFuture(null);
             }
 
-            ReflectionExpressions expr = buildUpdateAndConditionExpressions(modelObj, idVer.getIncomingVersion());
+            ReflectionExpressions expr = buildUpdateAndConditionExpressions(modelObj, idVer.getIncomingVersion(), idVer.getVersionKey());
             if (expr == null) {
                 return CompletableFuture.completedFuture(null);
             }
 
-            UpdateItemRequest request = buildUpdateRequest(idVer.getIdValue(), idVer.isIdNumeric(), expr);
-            log.debug("DynamoDB update: key={}, updateExpr='{}', condition='{}', EAN={}, EAV={}",
-                    idVer.getIdValue(), expr.updateExpr, expr.conditionExpr, expr.ean, expr.eav);
-
+            UpdateItemRequest request = buildUpdateRequest(idVer, expr);
             return dynamoDbAsyncClient.updateItem(request);
 
         } catch (NoSuchFieldException | IllegalAccessException ex) {
-            log.error("Reflection error in doConditionalUpdateAsync: {}", ex.getMessage(), ex);
+            log.error("Reflection error: {}", ex.getMessage(), ex);
             return CompletableFuture.completedFuture(null);
         }
     }
 
+    /**
+     * ✅ Extracts partition key and version key dynamically, supporting both Long and String IDs.
+     */
     private IdVersionResult extractIdAndVersion(Object modelObj)
             throws NoSuchFieldException, IllegalAccessException {
 
         Class<?> clazz = modelObj.getClass();
-        Field idField = clazz.getDeclaredField("id");
-        Field versionField = clazz.getDeclaredField("version");
+        Field idField = null;
+        Field versionField = null;
+
+        // Find fields annotated with @PartitionKey and @VersionKey
+        for (Field field : clazz.getDeclaredFields()) {
+            if (field.isAnnotationPresent(PartitionKey.class)) {
+                idField = field;
+            }
+            if (field.isAnnotationPresent(VersionKey.class)) {
+                versionField = field;
+            }
+        }
+
+        if (idField == null) {
+            throw new NoSuchFieldException("Partition key not found in class: " + clazz.getSimpleName());
+        }
+        if (versionField == null) {
+            throw new NoSuchFieldException("Version key not found in class: " + clazz.getSimpleName());
+        }
+
         idField.setAccessible(true);
         versionField.setAccessible(true);
 
@@ -106,18 +124,46 @@ public class AsyncDynamoDbWriter {
         }
 
         long incomingVersion = ((Number) verVal).longValue();
-
         boolean isNumeric = idVal instanceof Number;
-        return new IdVersionResult(idVal.toString(), isNumeric, incomingVersion);
+
+        return new IdVersionResult(idField.getName(), versionField.getName(), idVal.toString(), isNumeric, incomingVersion);
     }
 
-    private ReflectionExpressions buildUpdateAndConditionExpressions(Object modelObj, long incomingVersion)
+    /**
+     * ✅ Builds the DynamoDB UpdateItemRequest dynamically.
+     */
+    private UpdateItemRequest buildUpdateRequest(IdVersionResult idVer, ReflectionExpressions expr) {
+        Map<String, AttributeValue> key = Collections.singletonMap(
+                idVer.getPartitionKey(), idVer.isIdNumeric() ?
+                        AttributeValue.builder().n(idVer.getIdValue()).build() :
+                        AttributeValue.builder().s(idVer.getIdValue()).build()
+        );
+
+        UpdateItemRequest.Builder requestBuilder = UpdateItemRequest.builder()
+                .tableName(tableName)
+                .key(key)
+                .updateExpression(expr.updateExpr)
+                .conditionExpression(expr.conditionExpr)
+                .expressionAttributeValues(expr.eav);
+
+        if (!expr.ean.isEmpty()) {
+            requestBuilder.expressionAttributeNames(expr.ean);
+        }
+
+        return requestBuilder.build();
+    }
+
+    /**
+     * ✅ Builds the UpdateExpression and ConditionExpression.
+     * - Serializes nested objects and collections to JSON.
+     */
+    private ReflectionExpressions buildUpdateAndConditionExpressions(Object modelObj, long incomingVersion, String versionKey)
             throws IllegalAccessException {
 
         Class<?> clazz = modelObj.getClass();
         Field[] allFields = clazz.getDeclaredFields();
 
-        StringBuilder updateExpr = new StringBuilder("SET version = :incomingVersion");
+        StringBuilder updateExpr = new StringBuilder("SET " + versionKey + " = :incomingVersion");
         List<String> conditions = new ArrayList<>();
         Map<String, AttributeValue> eav = new HashMap<>();
         Map<String, String> ean = new HashMap<>();
@@ -127,7 +173,7 @@ public class AsyncDynamoDbWriter {
         for (Field f : allFields) {
             f.setAccessible(true);
             String fieldName = f.getName();
-            if ("id".equals(fieldName) || "version".equals(fieldName)) {
+            if (fieldName.equals(versionKey)) {
                 continue;
             }
 
@@ -136,7 +182,6 @@ public class AsyncDynamoDbWriter {
                 continue;
             }
 
-            // ✅ Convert nested objects & collections to JSON before storing
             String serializedValue = serializeToJson(fieldValue);
 
             String alias = "#r_" + fieldName;
@@ -157,41 +202,20 @@ public class AsyncDynamoDbWriter {
         }
 
         if (conditions.isEmpty()) {
-            log.debug("No updatable fields for class={}, skipping", clazz.getSimpleName());
             return null;
         }
 
         return new ReflectionExpressions(updateExpr.toString(), String.join(" AND ", conditions), eav, ean);
     }
 
-    private UpdateItemRequest buildUpdateRequest(String idVal, boolean isIdNumeric, ReflectionExpressions expr) {
-        Map<String, AttributeValue> key = Collections.singletonMap(
-                "id", isIdNumeric ? AttributeValue.builder().n(idVal).build()
-                        : AttributeValue.builder().s(idVal).build()
-        );
-
-        UpdateItemRequest.Builder requestBuilder = UpdateItemRequest.builder()
-                .tableName(tableName)
-                .key(key)
-                .updateExpression(expr.updateExpr)
-                .conditionExpression(expr.conditionExpr)
-                .expressionAttributeValues(expr.eav);
-
-        if (!expr.ean.isEmpty()) {
-            requestBuilder.expressionAttributeNames(expr.ean);
-        }
-
-        return requestBuilder.build();
-    }
-
     /**
-     * ✅ Converts nested objects & collections to JSON for DynamoDB storage.
+     * ✅ Converts nested objects and collections to JSON before storing in DynamoDB.
      */
     private String serializeToJson(Object val) {
         try {
             return objectMapper.writeValueAsString(val);
         } catch (JsonProcessingException e) {
-            log.error("JSON serialization failed for value: {}", val, e);
+            log.error("JSON serialization failed: {}", val, e);
             return "{}"; // Return empty JSON if serialization fails
         }
     }
@@ -199,6 +223,8 @@ public class AsyncDynamoDbWriter {
     @Getter
     @AllArgsConstructor
     private static class IdVersionResult {
+        private final String partitionKey;  // ✅ Stores the partition key name
+        private final String versionKey;    // ✅ Stores the version key name
         private final String idValue;
         private final boolean isIdNumeric;
         private final long incomingVersion;

@@ -1,5 +1,7 @@
 package com.example;
 
+import com.example.annotations.PartitionKey;
+import com.example.annotations.VersionKey;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import lombok.*;
 
@@ -12,8 +14,10 @@ import java.util.Map;
 @AllArgsConstructor
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class Dish {
-    private Long id;             // partition key
-    private Long version;        // concurrency version
+    @PartitionKey
+    private Long id;
+    @VersionKey
+    private Long version;
     private Long storeId;
     private Map<String, String> names;
     private Map<String, String> descriptions;
