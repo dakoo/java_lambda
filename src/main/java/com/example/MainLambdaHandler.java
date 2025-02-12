@@ -3,6 +3,7 @@ package com.example;
 import com.amazonaws.services.lambda.runtime.Context;
 import com.amazonaws.services.lambda.runtime.RequestHandler;
 import com.amazonaws.services.lambda.runtime.events.KafkaEvent;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient;
 
@@ -11,6 +12,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 @Slf4j
 public class MainLambdaHandler implements RequestHandler<KafkaEvent, String> {
+
+    private static final ObjectMapper objectMapper = new ObjectMapper();
 
     // ✅ Counters for tracking execution results
     private final AtomicInteger totalRecords = new AtomicInteger();
@@ -27,10 +30,19 @@ public class MainLambdaHandler implements RequestHandler<KafkaEvent, String> {
         otherFailedWrites.set(0);
 
         if (event == null) {
-            log.warn("Received null event.");
-            return "No event data";
+            String message = "No event data";
+            log.warn(message);
+            return message;
         }
-        log.info("event: {}", event);
+
+        try {
+            String jsonEvent = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(event);
+            log.info("Received Lambda Event:\n" + jsonEvent + "\n");
+        } catch (Exception e) {
+            String message = "Failed to serialize event to JSON: " + e.getMessage();
+            log.error(message);
+            return message;
+        }
 
         // 1) Load config from environment
         EnvironmentConfig config = EnvironmentConfig.loadFromSystemEnv();
@@ -80,6 +92,6 @@ public class MainLambdaHandler implements RequestHandler<KafkaEvent, String> {
         log.info("  - Successfully Written Records: " + successfulWrites.get() + "\n");
         log.info("  - ConditionalCheckFailedException Records: " + conditionalCheckFailedCount.get() + "\n");
         log.info("  - Other Failed Records: " + otherFailedWrites.get() + "\n");
-        return "";
+        return "completed";
     }
 }
