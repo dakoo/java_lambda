@@ -1,5 +1,7 @@
 package com.example;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.AllArgsConstructor;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
@@ -16,10 +18,13 @@ import java.util.concurrent.CompletableFuture;
  * - Reflects on a model object to build concurrency-based "fieldName_ver" logic.
  * - ALWAYS aliases all field names in the UpdateExpression (prevents reserved keyword issues).
  * - Dynamically detects whether the id field is a Number or String and formats it correctly.
+ * - **Handles nested objects (DishOption, DishOpenHour, etc.) as JSON blobs**.
  */
 @Slf4j
 @RequiredArgsConstructor
 public class AsyncDynamoDbWriter {
+
+    private static final ObjectMapper objectMapper = new ObjectMapper(); // ✅ For JSON serialization
 
     private final DynamoDbAsyncClient dynamoDbAsyncClient;
     private final String tableName;
@@ -112,7 +117,7 @@ public class AsyncDynamoDbWriter {
         Class<?> clazz = modelObj.getClass();
         Field[] allFields = clazz.getDeclaredFields();
 
-        StringBuilder updateExpr = new StringBuilder("SET version = :incomingVersion");  // ✅ Ensure version is updated
+        StringBuilder updateExpr = new StringBuilder("SET version = :incomingVersion");
         List<String> conditions = new ArrayList<>();
         Map<String, AttributeValue> eav = new HashMap<>();
         Map<String, String> ean = new HashMap<>();
@@ -131,6 +136,9 @@ public class AsyncDynamoDbWriter {
                 continue;
             }
 
+            // ✅ Convert nested objects & collections to JSON before storing
+            String serializedValue = serializeToJson(fieldValue);
+
             String alias = "#r_" + fieldName;
             ean.put(alias, fieldName);
 
@@ -139,7 +147,7 @@ public class AsyncDynamoDbWriter {
             ean.put(verAlias, verName);
 
             String placeholder = ":" + fieldName;
-            eav.put(placeholder, toAttributeValue(fieldValue));
+            eav.put(placeholder, AttributeValue.builder().s(serializedValue).build());
 
             updateExpr.append(", ").append(alias).append(" = ").append(placeholder)
                     .append(", ").append(verAlias).append(" = :incomingVersion");
@@ -176,11 +184,16 @@ public class AsyncDynamoDbWriter {
         return requestBuilder.build();
     }
 
-    private AttributeValue toAttributeValue(Object val) {
-        if (val instanceof Number) {
-            return AttributeValue.builder().n(val.toString()).build();
+    /**
+     * ✅ Converts nested objects & collections to JSON for DynamoDB storage.
+     */
+    private String serializeToJson(Object val) {
+        try {
+            return objectMapper.writeValueAsString(val);
+        } catch (JsonProcessingException e) {
+            log.error("JSON serialization failed for value: {}", val, e);
+            return "{}"; // Return empty JSON if serialization fails
         }
-        return AttributeValue.builder().s(val.toString()).build();
     }
 
     @Getter
