@@ -8,7 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 
 @Slf4j
-public class DishJsonBase64Parser implements ParserInterface<Dish> {
+public class DishParser implements ParserInterface<Dish> {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
