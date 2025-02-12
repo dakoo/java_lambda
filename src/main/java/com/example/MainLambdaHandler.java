@@ -7,9 +7,16 @@ import lombok.extern.slf4j.Slf4j;
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient;
 
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 @Slf4j
 public class MainLambdaHandler implements RequestHandler<KafkaEvent, String> {
+
+    // ✅ Counters for tracking execution results
+    private final AtomicInteger totalRecords = new AtomicInteger(0);
+    private final AtomicInteger successfulWrites = new AtomicInteger(0);
+    private final AtomicInteger conditionalCheckFailedCount = new AtomicInteger(0);
+    private final AtomicInteger otherFailedWrites = new AtomicInteger(0);
 
     @Override
     public String handleRequest(KafkaEvent event, Context context) {
@@ -17,6 +24,7 @@ public class MainLambdaHandler implements RequestHandler<KafkaEvent, String> {
             log.warn("Received null event.");
             return "No event data";
         }
+        log.info("event: {}", event);
 
         // 1) Load config from environment
         EnvironmentConfig config = EnvironmentConfig.loadFromSystemEnv();
@@ -32,9 +40,8 @@ public class MainLambdaHandler implements RequestHandler<KafkaEvent, String> {
 
         // 4) Create the DynamoDB async client + writer
         DynamoDbAsyncClient ddbAsyncClient = DynamoDbAsyncClient.builder().build();
-        AsyncDynamoDbWriter writer = new AsyncDynamoDbWriter(ddbAsyncClient, config.getDynamoDbTableName());
-
-        int parsedCount = 0;
+        AsyncDynamoDbWriter writer = new AsyncDynamoDbWriter(ddbAsyncClient, config.getDynamoDbTableName(),
+                successfulWrites, conditionalCheckFailedCount, otherFailedWrites);
 
         // 5) For each record, parse + prepare a write (unless DRY_RUN)
         for (KafkaEvent.KafkaEventRecord r : records) {
@@ -43,14 +50,15 @@ public class MainLambdaHandler implements RequestHandler<KafkaEvent, String> {
                 Object modelObj = parser.parseRecord(r);
                 if (modelObj != null) {
                     log.debug("Parsed model: {}", modelObj);
+                    totalRecords.incrementAndGet();
                     if (!config.isDryRun()) {
                         writer.prepareWrite(modelObj);
                     }
-                    parsedCount++;
                 }
             } catch (Exception e) {
                 log.error("Error parsing record offset={} partition={}: {}",
                         r.getOffset(), r.getPartition(), e.getMessage(), e);
+                otherFailedWrites.incrementAndGet();
             }
         }
 
@@ -61,8 +69,11 @@ public class MainLambdaHandler implements RequestHandler<KafkaEvent, String> {
             log.info("DRY_RUN=true, skipping DynamoDB writes.");
         }
 
-        String result = "Processed " + parsedCount + " record(s). (DRY_RUN=" + config.isDryRun() + ")";
-        log.info(result);
-        return result;
+        log.info("\nLambda Execution Summary:\n");
+        log.info("  - Total Records Processed: " + totalRecords.get() + "\n");
+        log.info("  - Successfully Written Records: " + successfulWrites.get() + "\n");
+        log.info("  - ConditionalCheckFailedException Records: " + conditionalCheckFailedCount.get() + "\n");
+        log.info("  - Other Failed Records: " + otherFailedWrites.get() + "\n");
+        return "";
     }
 }

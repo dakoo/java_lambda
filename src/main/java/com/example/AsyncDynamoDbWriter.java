@@ -1,3 +1,4 @@
+
 package com.example;
 
 import com.example.annotations.PartitionKey;
@@ -14,21 +15,24 @@ import software.amazon.awssdk.services.dynamodb.model.*;
 import java.lang.reflect.Field;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Handles asynchronous writes to DynamoDB.
- * - Supports dynamic partition key and version key using annotations.
- * - Supports nested objects (DishOption, DishOpenHour) as JSON blobs.
- * - Uses reflection to dynamically extract fields.
- * - Applies conditional updates for versioning.
  */
 @Slf4j
 @RequiredArgsConstructor
 public class AsyncDynamoDbWriter {
 
-    private static final ObjectMapper objectMapper = new ObjectMapper(); // ✅ JSON Serializer
+    private static final ObjectMapper objectMapper = new ObjectMapper();
     private final DynamoDbAsyncClient dynamoDbAsyncClient;
     private final String tableName;
+
+    // ✅ Counters for tracking execution results
+    private final AtomicInteger successfulWrites;
+    private final AtomicInteger conditionalCheckFailedCount;
+    private final AtomicInteger otherFailedWrites;
+
     private final List<Object> pendingModels = new ArrayList<>();
 
     public void prepareWrite(Object modelObj) {
@@ -47,14 +51,19 @@ public class AsyncDynamoDbWriter {
         for (Object model : pendingModels) {
             CompletableFuture<UpdateItemResponse> future =
                     doConditionalUpdateAsync(model)
+                            .thenApply(response -> {
+                                successfulWrites.incrementAndGet();
+                                return response;
+                            })
                             .exceptionally(ex -> {
                                 if (ex.getCause() instanceof ConditionalCheckFailedException) {
-                                    log.warn("Conditional update failed: {}", ex.getMessage());
-                                    return null;
+                                    conditionalCheckFailedCount.incrementAndGet();
+                                    log.warn("Conditional update failed.");
                                 } else {
+                                    otherFailedWrites.incrementAndGet();
                                     log.error("Async update failed: {}", ex.getMessage(), ex);
-                                    return null;
                                 }
+                                return null;
                             });
 
             futures.add(future);
@@ -68,10 +77,10 @@ public class AsyncDynamoDbWriter {
         try {
             IdVersionResult idVer = extractIdAndVersion(modelObj);
             if (idVer == null) {
+                otherFailedWrites.incrementAndGet();
                 return CompletableFuture.completedFuture(null);
             }
 
-            // ✅ Pass partitionKey to exclude it from updates
             ReflectionExpressions expr = buildUpdateAndConditionExpressions(modelObj, idVer.getIncomingVersion(), idVer.getVersionKey(), idVer.getPartitionKey());
             if (expr == null) {
                 return CompletableFuture.completedFuture(null);
@@ -82,6 +91,7 @@ public class AsyncDynamoDbWriter {
 
         } catch (NoSuchFieldException | IllegalAccessException ex) {
             log.error("Reflection error: {}", ex.getMessage(), ex);
+            otherFailedWrites.incrementAndGet();
             return CompletableFuture.completedFuture(null);
         }
     }
