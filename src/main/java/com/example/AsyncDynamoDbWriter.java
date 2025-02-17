@@ -60,15 +60,22 @@ public class AsyncDynamoDbWriter {
                             return response;
                         })
                         .exceptionally(ex -> {
-                            if (ex.getCause() instanceof ConditionalCheckFailedException) {
+                            Throwable cause = ex.getCause();
+                            log.error("Async update failed: {}, cause: {}",
+                                    ex.getMessage(),
+                                    cause != null ? cause.getClass().getSimpleName() : "Unknown",
+                                    ex);
+
+                            if (cause instanceof ConditionalCheckFailedException) {
                                 conditionalCheckFailedCount.incrementAndGet();
-                                log.warn("Conditional update failed.");
+                                log.warn("Conditional update failed due to version mismatch.");
                             } else {
                                 otherFailedWrites.incrementAndGet();
-                                log.error("Async update failed: {}", ex.getMessage(), ex);
+                                log.error("Async update failed due to unexpected error.");
                             }
                             return null;
                         });
+
             }, executor); // ✅ Uses the defined ExecutorService
             futures.add(future);
         }
@@ -91,12 +98,16 @@ public class AsyncDynamoDbWriter {
             }
 
             UpdateItemRequest request = buildUpdateRequest(idVer, expr);
+            log.info("Executing DynamoDB update: {}", request);
             return dynamoDbAsyncClient.updateItem(request);
 
         } catch (NoSuchFieldException | IllegalAccessException ex) {
             log.error("Reflection error: {}", ex.getMessage(), ex);
             otherFailedWrites.incrementAndGet();
             return CompletableFuture.completedFuture(null);
+        } catch (Exception e) {
+            log.error("Error before sending request: {}", e.getMessage(), e);
+            return CompletableFuture.failedFuture(e); // ✅ Ensure it always returns a future
         }
     }
 
