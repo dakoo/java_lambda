@@ -1,97 +1,84 @@
 package com.example;
 
 import com.amazonaws.services.lambda.runtime.Context;
-import com.amazonaws.services.lambda.runtime.RequestHandler;
+import com.amazonaws.services.lambda.runtime.LambdaLogger;
 import com.amazonaws.services.lambda.runtime.events.KafkaEvent;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient;
 
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
+/**
+ * AWS Lambda Handler for processing Kafka events and writing to DynamoDB.
+ */
 @Slf4j
-public class MainLambdaHandler implements RequestHandler<KafkaEvent, String> {
+public class MainLambdaHandler {
 
-    private static final ObjectMapper objectMapper = new ObjectMapper();
+    private final DynamoDbAsyncClient dynamoDbAsyncClient = DynamoDbAsyncClient.create();
+    private final String tableName = System.getenv("DYNAMODB_TABLE_NAME");
 
-    // ✅ Counters for tracking execution results
+    // ✅ Counters for execution tracking (reset per invocation)
     private final AtomicInteger totalRecords = new AtomicInteger();
     private final AtomicInteger successfulWrites = new AtomicInteger();
     private final AtomicInteger conditionalCheckFailedCount = new AtomicInteger();
     private final AtomicInteger otherFailedWrites = new AtomicInteger();
 
-    @Override
-    public String handleRequest(KafkaEvent event, Context context) {
-        // ✅ Reset counters for the new invocation
+    public void handleRequest(KafkaEvent event, Context context) {
+        long startTime = System.currentTimeMillis();
+        LambdaLogger logger = context.getLogger();
+
+        // ✅ Reset counters for new invocation
         totalRecords.set(0);
         successfulWrites.set(0);
         conditionalCheckFailedCount.set(0);
         otherFailedWrites.set(0);
 
-        if (event == null) {
-            String message = "No event data";
-            log.warn(message);
-            return message;
-        }
+        AsyncDynamoDbWriter writer = new AsyncDynamoDbWriter(
+                dynamoDbAsyncClient, tableName, successfulWrites, conditionalCheckFailedCount, otherFailedWrites
+        );
 
-        try {
-            String jsonEvent = objectMapper.writeValueAsString(event);
-            log.info("Received Lambda Event:\n" + jsonEvent + "\n");
-        } catch (Exception e) {
-            String message = "Failed to serialize event to JSON: " + e.getMessage();
-            log.error(message);
-            return message;
-        }
+        // ✅ Retrieve parser from environment variable
+        String parserName = System.getenv("PARSER_NAME");
+        ParserInterface<?> parser = ParserFactory.createParser(parserName);
 
-        // 1) Load config from environment
-        EnvironmentConfig config = EnvironmentConfig.loadFromSystemEnv();
-        log.info("Loaded environment: {}", config);
+        logger.log("Processing records...\n");
 
-        // 2) Flatten the Kafka event
-        List<KafkaEvent.KafkaEventRecord> records = KafkaEventFlattener.flatten(event);
-        log.info("Flattened {} record(s).", records.size());
-
-        // 3) Create the parser via factory
-        ParserInterface<?> parser = ParserFactory.createParser(config.getParserName());
-        log.info("Using parser: {}", config.getParserName());
-
-        // 4) Create the DynamoDB async client + writer
-        DynamoDbAsyncClient ddbAsyncClient = DynamoDbAsyncClient.builder().build();
-        AsyncDynamoDbWriter writer = new AsyncDynamoDbWriter(ddbAsyncClient, config.getDynamoDbTableName(),
-                successfulWrites, conditionalCheckFailedCount, otherFailedWrites);
-
-        // 5) For each record, parse + prepare a write (unless DRY_RUN)
-        for (KafkaEvent.KafkaEventRecord r : records) {
-            try {
-                // parse
-                Object modelObj = parser.parseRecord(r);
-                if (modelObj != null) {
-                    log.debug("Parsed model: {}", modelObj);
-                    totalRecords.incrementAndGet();
-                    if (!config.isDryRun()) {
-                        writer.prepareWrite(modelObj);
+        // ✅ Process Kafka records asynchronously
+        List<CompletableFuture<Void>> parseFutures = event.getRecords().values().stream()
+                .flatMap(List::stream)
+                .map(record -> CompletableFuture.runAsync(() -> {
+                    try {
+                        Object model = parser.parseRecord(record);
+                        if (model != null) {
+                            totalRecords.incrementAndGet();
+                            writer.prepareWrite(model);
+                        }
+                    } catch (Exception e) {
+                        log.error("Failed to parse Kafka record: {}", e.getMessage(), e);
+                        otherFailedWrites.incrementAndGet();
                     }
-                }
-            } catch (Exception e) {
-                log.error("Error parsing record offset={} partition={}: {}",
-                        r.getOffset(), r.getPartition(), e.getMessage(), e);
-                otherFailedWrites.incrementAndGet();
-            }
-        }
+                }))
+                .collect(Collectors.toList());
 
-        // 6) If not DRY_RUN, do asynchronous writes with concurrency checks
-        if (!config.isDryRun()) {
-            writer.executeAsyncWrites();
-        } else {
-            log.info("DRY_RUN=true, skipping DynamoDB writes.");
-        }
+        // ✅ Wait for all parsing tasks to complete
+        CompletableFuture.allOf(parseFutures.toArray(new CompletableFuture[0])).join();
 
-        log.info("\nLambda Execution Summary:\n");
-        log.info("  - Total Records Processed: " + totalRecords.get() + "\n");
-        log.info("  - Successfully Written Records: " + successfulWrites.get() + "\n");
-        log.info("  - ConditionalCheckFailedException Records: " + conditionalCheckFailedCount.get() + "\n");
-        log.info("  - Other Failed Records: " + otherFailedWrites.get() + "\n");
-        return "completed";
+        // ✅ Execute batch writes and wait for completion
+        writer.executeAsyncWrites().join();
+
+        // ✅ Log final execution summary
+        long totalTime = System.currentTimeMillis() - startTime;
+
+        logger.log("Lambda Execution Summary: " +
+                "{ \"Total Records\": " + totalRecords.get() +
+                ", \"Successful Writes\": " + successfulWrites.get() +
+                ", \"ConditionalCheckFailed\": " + conditionalCheckFailedCount.get() +
+                ", \"Other Failed\": " + otherFailedWrites.get() +
+                ", \"Execution Time (ms)\": " + totalTime + " }\n");
+
+        log.info("Lambda execution completed.");
     }
 }

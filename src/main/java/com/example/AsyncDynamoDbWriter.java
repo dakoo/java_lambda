@@ -1,24 +1,19 @@
-
 package com.example;
 
-import com.example.annotations.PartitionKey;
-import com.example.annotations.VersionKey;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import lombok.AllArgsConstructor;
-import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient;
 import software.amazon.awssdk.services.dynamodb.model.*;
 
-import java.lang.reflect.Field;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 /**
- * Handles asynchronous writes to DynamoDB.
+ * Handles batch writes to DynamoDB asynchronously.
  */
 @Slf4j
 @RequiredArgsConstructor
@@ -28,224 +23,107 @@ public class AsyncDynamoDbWriter {
     private final DynamoDbAsyncClient dynamoDbAsyncClient;
     private final String tableName;
 
-    // ✅ Counters for tracking execution results
+    private static final int MAX_BATCH_SIZE = 25; // ✅ DynamoDB batch limit
+
+    // ✅ Counters for execution tracking
     private final AtomicInteger successfulWrites;
     private final AtomicInteger conditionalCheckFailedCount;
     private final AtomicInteger otherFailedWrites;
 
-    private final List<Object> pendingModels = new ArrayList<>();
+    private final List<Map<String, AttributeValue>> pendingItems = new ArrayList<>();
+    private final List<CompletableFuture<BatchWriteItemResponse>> pendingFutures = new ArrayList<>();
 
+    /**
+     * Prepare an item for batch writing.
+     */
     public void prepareWrite(Object modelObj) {
-        if (modelObj != null) {
-            pendingModels.add(modelObj);
-        }
-    }
-
-    public void executeAsyncWrites() {
-        if (pendingModels.isEmpty()) {
-            return;
-        }
-
-        List<CompletableFuture<UpdateItemResponse>> futures = new ArrayList<>();
-
-        for (Object model : pendingModels) {
-            CompletableFuture<UpdateItemResponse> future =
-                    doConditionalUpdateAsync(model)
-                            .thenApply(response -> {
-                                successfulWrites.incrementAndGet();
-                                return response;
-                            })
-                            .exceptionally(ex -> {
-                                if (ex.getCause() instanceof ConditionalCheckFailedException) {
-                                    conditionalCheckFailedCount.incrementAndGet();
-                                    log.warn("Conditional update failed.");
-                                } else {
-                                    otherFailedWrites.incrementAndGet();
-                                    log.error("Async update failed: {}", ex.getMessage(), ex);
-                                }
-                                return null;
-                            });
-
-            futures.add(future);
-        }
-
-        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-        pendingModels.clear();
-    }
-
-    private CompletableFuture<UpdateItemResponse> doConditionalUpdateAsync(Object modelObj) {
         try {
-            IdVersionResult idVer = extractIdAndVersion(modelObj);
-            if (idVer == null) {
-                otherFailedWrites.incrementAndGet();
-                return CompletableFuture.completedFuture(null);
+            Map<String, AttributeValue> item = convertToDynamoDBItem(modelObj);
+            if (item != null) {
+                pendingItems.add(item);
             }
-
-            ReflectionExpressions expr = buildUpdateAndConditionExpressions(modelObj, idVer.getIncomingVersion(), idVer.getVersionKey(), idVer.getPartitionKey());
-            if (expr == null) {
-                return CompletableFuture.completedFuture(null);
-            }
-
-            UpdateItemRequest request = buildUpdateRequest(idVer, expr);
-            return dynamoDbAsyncClient.updateItem(request);
-
-        } catch (NoSuchFieldException | IllegalAccessException ex) {
-            log.error("Reflection error: {}", ex.getMessage(), ex);
+        } catch (Exception e) {
+            log.error("Failed to convert item: {}", e.getMessage(), e);
             otherFailedWrites.incrementAndGet();
-            return CompletableFuture.completedFuture(null);
+        }
+
+        // ✅ If batch reaches limit, flush it asynchronously
+        if (pendingItems.size() >= MAX_BATCH_SIZE) {
+            flushBatch();
         }
     }
 
     /**
-     * ✅ Extracts partition key and version key dynamically, supporting both Long and String IDs.
+     * Ensures all pending writes are completed before Lambda exits.
      */
-    private IdVersionResult extractIdAndVersion(Object modelObj)
-            throws NoSuchFieldException, IllegalAccessException {
+    public CompletableFuture<Void> executeAsyncWrites() {
+        if (!pendingItems.isEmpty()) {
+            flushBatch(); // ✅ Flush remaining items before finishing
+        }
 
+        // ✅ Wait for all batch writes to complete before Lambda exits
+        return CompletableFuture.allOf(pendingFutures.toArray(new CompletableFuture[0]));
+    }
+
+    /**
+     * Converts model object to DynamoDB format.
+     */
+    private Map<String, AttributeValue> convertToDynamoDBItem(Object modelObj) throws IllegalAccessException {
+        Map<String, AttributeValue> item = new HashMap<>();
         Class<?> clazz = modelObj.getClass();
-        Field idField = null;
-        Field versionField = null;
 
-        // Find fields annotated with @PartitionKey and @VersionKey
-        for (Field field : clazz.getDeclaredFields()) {
-            if (field.isAnnotationPresent(PartitionKey.class)) {
-                idField = field;
-            }
-            if (field.isAnnotationPresent(VersionKey.class)) {
-                versionField = field;
-            }
+        for (var field : clazz.getDeclaredFields()) {
+            field.setAccessible(true);
+            Object value = field.get(modelObj);
+            if (value == null) continue;
+
+            item.put(field.getName(), AttributeValue.builder().s(serializeToJson(value)).build());
         }
 
-        if (idField == null) {
-            throw new NoSuchFieldException("Partition key not found in class: " + clazz.getSimpleName());
-        }
-        if (versionField == null) {
-            throw new NoSuchFieldException("Version key not found in class: " + clazz.getSimpleName());
-        }
-
-        idField.setAccessible(true);
-        versionField.setAccessible(true);
-
-        Object idVal = idField.get(modelObj);
-        Object verVal = versionField.get(modelObj);
-
-        if (idVal == null || verVal == null) {
-            log.warn("Skipping model with null id/version. class={}", clazz.getSimpleName());
-            return null;
-        }
-
-        long incomingVersion = ((Number) verVal).longValue();
-        boolean isNumeric = idVal instanceof Number;
-
-        return new IdVersionResult(idField.getName(), versionField.getName(), idVal.toString(), isNumeric, incomingVersion);
+        return item;
     }
 
     /**
-     * ✅ Builds the DynamoDB UpdateItemRequest dynamically.
+     * Asynchronously sends a batch request to DynamoDB.
      */
-    private UpdateItemRequest buildUpdateRequest(IdVersionResult idVer, ReflectionExpressions expr) {
-        Map<String, AttributeValue> key = Collections.singletonMap(
-                idVer.getPartitionKey(), idVer.isIdNumeric() ?
-                        AttributeValue.builder().n(idVer.getIdValue()).build() :
-                        AttributeValue.builder().s(idVer.getIdValue()).build()
-        );
+    private void flushBatch() {
+        if (pendingItems.isEmpty()) return;
 
-        UpdateItemRequest.Builder requestBuilder = UpdateItemRequest.builder()
-                .tableName(tableName)
-                .key(key)
-                .updateExpression(expr.updateExpr)
-                .conditionExpression(expr.conditionExpr)
-                .expressionAttributeValues(expr.eav);
+        List<WriteRequest> writeRequests = pendingItems.stream()
+                .map(item -> WriteRequest.builder()
+                        .putRequest(PutRequest.builder().item(item).build())
+                        .build())
+                .collect(Collectors.toList());
 
-        if (!expr.ean.isEmpty()) {
-            requestBuilder.expressionAttributeNames(expr.ean);
-        }
+        BatchWriteItemRequest batchRequest = BatchWriteItemRequest.builder()
+                .requestItems(Collections.singletonMap(tableName, writeRequests))
+                .build();
 
-        return requestBuilder.build();
+        CompletableFuture<BatchWriteItemResponse> future = dynamoDbAsyncClient.batchWriteItem(batchRequest)
+                .thenApply(response -> {
+                    successfulWrites.addAndGet(pendingItems.size());
+                    log.info("Batch write successful: {} items written.", pendingItems.size());
+                    return response;
+                })
+                .exceptionally(ex -> {
+                    log.error("Batch write failed: {}", ex.getMessage(), ex);
+                    otherFailedWrites.addAndGet(pendingItems.size());
+                    return null;
+                });
+
+        pendingFutures.add(future); // ✅ Track future for waiting before Lambda exit
+        pendingItems.clear(); // ✅ Clear pending items after sending
     }
-
-    private ReflectionExpressions buildUpdateAndConditionExpressions(Object modelObj, long incomingVersion, String versionKey, String partitionKey)
-            throws IllegalAccessException {
-
-        Class<?> clazz = modelObj.getClass();
-        Field[] allFields = clazz.getDeclaredFields();
-
-        StringBuilder updateExpr = new StringBuilder("SET " + versionKey + " = :incomingVersion");
-        List<String> conditions = new ArrayList<>();
-        Map<String, AttributeValue> eav = new HashMap<>();
-        Map<String, String> ean = new HashMap<>();
-
-        eav.put(":incomingVersion", AttributeValue.builder().n(Long.toString(incomingVersion)).build());
-
-        for (Field f : allFields) {
-            f.setAccessible(true);
-            String fieldName = f.getName();
-
-            // ✅ Skip partition key to avoid DynamoDB error
-            if (fieldName.equals(versionKey) || fieldName.equals(partitionKey)) {
-                continue;
-            }
-
-            Object fieldValue = f.get(modelObj);
-            if (fieldValue == null) {
-                continue;
-            }
-
-            String serializedValue = serializeToJson(fieldValue);
-
-            String alias = "#r_" + fieldName;
-            ean.put(alias, fieldName);
-
-            String verName = fieldName + "_ver";
-            String verAlias = "#r_" + verName;
-            ean.put(verAlias, verName);
-
-            String placeholder = ":" + fieldName;
-            eav.put(placeholder, AttributeValue.builder().s(serializedValue).build());
-
-            updateExpr.append(", ").append(alias).append(" = ").append(placeholder)
-                    .append(", ").append(verAlias).append(" = :incomingVersion");
-
-            String cond = "(attribute_not_exists(" + verAlias + ") OR " + verAlias + " < :incomingVersion)";
-            conditions.add(cond);
-        }
-
-        if (conditions.isEmpty()) {
-            return null;
-        }
-
-        return new ReflectionExpressions(updateExpr.toString(), String.join(" AND ", conditions), eav, ean);
-    }
-
 
     /**
-     * ✅ Converts nested objects and collections to JSON before storing in DynamoDB.
+     * Converts an object to a JSON string for DynamoDB storage.
      */
-    private String serializeToJson(Object val) {
+    private String serializeToJson(Object value) {
         try {
-            return objectMapper.writeValueAsString(val);
+            return objectMapper.writeValueAsString(value);
         } catch (JsonProcessingException e) {
-            log.error("JSON serialization failed: {}", val, e);
+            log.error("JSON serialization failed: {}", value, e);
             return "{}"; // Return empty JSON if serialization fails
         }
-    }
-
-    @Getter
-    @AllArgsConstructor
-    private static class IdVersionResult {
-        private final String partitionKey;  // ✅ Stores the partition key name
-        private final String versionKey;    // ✅ Stores the version key name
-        private final String idValue;
-        private final boolean isIdNumeric;
-        private final long incomingVersion;
-    }
-
-    @Getter
-    @AllArgsConstructor
-    private static class ReflectionExpressions {
-        private final String updateExpr;
-        private final String conditionExpr;
-        private final Map<String, AttributeValue> eav;
-        private final Map<String, String> ean;
     }
 }
