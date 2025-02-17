@@ -75,7 +75,6 @@ public class AsyncDynamoDbWriter {
                             }
                             return null;
                         });
-
             }, executor); // ✅ Uses the defined ExecutorService
             futures.add(future);
         }
@@ -99,7 +98,9 @@ public class AsyncDynamoDbWriter {
 
             UpdateItemRequest request = buildUpdateRequest(idVer, expr);
             log.info("Executing DynamoDB update: {}", request);
-            return dynamoDbAsyncClient.updateItem(request);
+            CompletableFuture<UpdateItemResponse> future = dynamoDbAsyncClient.updateItem(request);
+            log.info("DynamoDB update sent successfully: {}", request);
+            return future;
 
         } catch (NoSuchFieldException | IllegalAccessException ex) {
             log.error("Reflection error: {}", ex.getMessage(), ex);
