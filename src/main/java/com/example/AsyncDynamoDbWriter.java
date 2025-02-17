@@ -1,7 +1,5 @@
 package com.example;
 
-import com.example.annotations.PartitionKey;
-import com.example.annotations.VersionKey;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
@@ -9,39 +7,39 @@ import lombok.extern.slf4j.Slf4j;
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient;
 import software.amazon.awssdk.services.dynamodb.model.*;
 
-import java.lang.reflect.Field;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 /**
- * Handles asynchronous batch writes to DynamoDB in groups of up to 25 items.
+ * Handles **fully asynchronous batch writes** to DynamoDB in chunks of up to 25 items.
  */
 @Slf4j
 @RequiredArgsConstructor
 public class AsyncDynamoDbWriter {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
-
     private final DynamoDbAsyncClient dynamoDbAsyncClient;
     private final String tableName;
 
-    // Counters for success/failure/tracking
+    // ✅ Atomic counters for execution tracking
     private final AtomicInteger successfulWrites;
     private final AtomicInteger conditionalCheckFailedCount;
     private final AtomicInteger otherFailedWrites;
 
-    // For grouping items before flush
+    // ✅ Maximum batch size for DynamoDB
     private static final int MAX_BATCH_SIZE = 25;
+
+    // ✅ List to collect items before writing
     private final List<Map<String, AttributeValue>> pendingItems = new ArrayList<>();
 
-    // Keep track of ongoing batch requests
+    // ✅ Track batch write futures
     private final List<CompletableFuture<BatchWriteItemResponse>> pendingFutures = new ArrayList<>();
 
     /**
      * Prepare an item for batch writing.
-     * If pendingItems reaches 25, flush the batch immediately.
+     * If pendingItems reaches 25, flush the batch asynchronously.
      */
     public void prepareWrite(Object model) {
         try {
@@ -54,67 +52,95 @@ public class AsyncDynamoDbWriter {
             otherFailedWrites.incrementAndGet();
         }
 
+        // ✅ If pendingItems reaches 25, flush immediately
         if (pendingItems.size() >= MAX_BATCH_SIZE) {
             flushBatch();
         }
     }
 
     /**
-     * Flush any remaining items, then wait for all batch operations to complete.
+     * Flushes any remaining items and waits for all batch writes to complete.
      */
     public CompletableFuture<Void> executeAsyncWrites() {
         if (!pendingItems.isEmpty()) {
-            flushBatch();
+            flushBatch(); // ✅ Flush remaining items before finishing
         }
+
+        // ✅ Wait for all batch writes to complete before Lambda exits
         return CompletableFuture.allOf(pendingFutures.toArray(new CompletableFuture[0]));
     }
 
     /**
-     * Convert a model object to a DynamoDB item (Map<String, AttributeValue>).
-     * Also logs partition key and version key for debugging.
+     * Flushes a batch of items asynchronously to DynamoDB.
+     * If more than 25 items are pending, splits them into multiple batches.
+     */
+    private void flushBatch() {
+        if (pendingItems.isEmpty()) return;
+
+        // ✅ Split into chunks of 25 for batch write
+        List<List<Map<String, AttributeValue>>> batches = splitIntoBatches(pendingItems, MAX_BATCH_SIZE);
+
+        for (List<Map<String, AttributeValue>> batch : batches) {
+            List<WriteRequest> writeRequests = batch.stream()
+                    .map(item -> WriteRequest.builder()
+                            .putRequest(PutRequest.builder().item(item).build())
+                            .build())
+                    .collect(Collectors.toList());
+
+            BatchWriteItemRequest batchRequest = BatchWriteItemRequest.builder()
+                    .requestItems(Collections.singletonMap(tableName, writeRequests))
+                    .build();
+
+            CompletableFuture<BatchWriteItemResponse> future = dynamoDbAsyncClient.batchWriteItem(batchRequest)
+                    .thenApply(response -> {
+                        successfulWrites.addAndGet(batch.size());
+                        log.info("Batch write successful: {} items written.", batch.size());
+                        return response;
+                    })
+                    .exceptionally(ex -> {
+                        log.error("Batch write failed: {}", ex.getMessage(), ex);
+                        otherFailedWrites.addAndGet(batch.size());
+                        return null;
+                    });
+
+            pendingFutures.add(future);
+        }
+
+        // ✅ Clear the pendingItems list after writing
+        pendingItems.clear();
+    }
+
+    /**
+     * Splits a list into batches of maxSize.
+     */
+    private List<List<Map<String, AttributeValue>>> splitIntoBatches(List<Map<String, AttributeValue>> items, int maxSize) {
+        List<List<Map<String, AttributeValue>>> batches = new ArrayList<>();
+        for (int i = 0; i < items.size(); i += maxSize) {
+            batches.add(new ArrayList<>(items.subList(i, Math.min(items.size(), i + maxSize))));
+        }
+        return batches;
+    }
+
+    /**
+     * Converts a model object to a DynamoDB item.
      */
     private Map<String, AttributeValue> convertToDynamoItem(Object modelObj) throws IllegalAccessException {
         Map<String, AttributeValue> item = new HashMap<>();
         Class<?> clazz = modelObj.getClass();
 
-        String partitionKeyName = null;
-        String versionKeyName = null;
-
-        for (Field f : clazz.getDeclaredFields()) {
-            f.setAccessible(true);
-            Object value = f.get(modelObj);
+        for (var field : clazz.getDeclaredFields()) {
+            field.setAccessible(true);
+            Object value = field.get(modelObj);
             if (value == null) continue;
 
-            // Detect partition key & version key
-            if (f.isAnnotationPresent(PartitionKey.class)) {
-                partitionKeyName = f.getName();
-            }
-            if (f.isAnnotationPresent(VersionKey.class)) {
-                versionKeyName = f.getName();
-            }
-
-            item.put(f.getName(), convertToAttributeValue(value));
-        }
-
-        // Log partition key if present
-        if (partitionKeyName != null && item.containsKey(partitionKeyName)) {
-            AttributeValue pkAttr = item.get(partitionKeyName);
-            log.info("Partition Key: {}={} (Type: {})", partitionKeyName, pkAttr, pkAttr.type());
-        } else {
-            log.warn("PartitionKey not found or missing in item: {}", item);
-        }
-
-        // Log version key if present
-        if (versionKeyName != null && item.containsKey(versionKeyName)) {
-            AttributeValue verAttr = item.get(versionKeyName);
-            log.info("Version Key: {}={} (Type: {})", versionKeyName, verAttr, verAttr.type());
+            item.put(field.getName(), convertToAttributeValue(value));
         }
 
         return item;
     }
 
     /**
-     * Convert a Java object to DynamoDB AttributeValue.
+     * Converts Java objects to DynamoDB AttributeValue.
      */
     private AttributeValue convertToAttributeValue(Object value) {
         if (value instanceof Number) {
@@ -136,54 +162,18 @@ public class AsyncDynamoDbWriter {
                     ));
             return AttributeValue.builder().m(mapVal).build();
         } else {
-            // fallback -> store as JSON string
             return AttributeValue.builder().s(serializeToJson(value)).build();
         }
     }
 
     /**
-     * Actually flush the batch (if pendingItems are > 0).
+     * Serializes an object to JSON.
      */
-    private void flushBatch() {
-        if (pendingItems.isEmpty()) {
-            return;
-        }
-
-        List<WriteRequest> writeRequests = pendingItems.stream()
-                .map(item -> WriteRequest.builder()
-                        .putRequest(PutRequest.builder().item(item).build())
-                        .build())
-                .collect(Collectors.toList());
-
-        BatchWriteItemRequest batchRequest = BatchWriteItemRequest.builder()
-                .requestItems(Collections.singletonMap(tableName, writeRequests))
-                .build();
-
-        CompletableFuture<BatchWriteItemResponse> future = dynamoDbAsyncClient.batchWriteItem(batchRequest)
-                .thenApply(response -> {
-                    // On success
-                    successfulWrites.addAndGet(pendingItems.size());
-                    log.info("Batch write successful: {} items written.", pendingItems.size());
-                    return response;
-                })
-                .exceptionally(ex -> {
-                    log.error("Batch write failed: {}", ex.getMessage(), ex);
-                    otherFailedWrites.addAndGet(pendingItems.size());
-                    return null;
-                });
-
-        pendingFutures.add(future);
-        pendingItems.clear();
-    }
-
-    /**
-     * Convert object to JSON string for fallback storage.
-     */
-    private String serializeToJson(Object val) {
+    private String serializeToJson(Object value) {
         try {
-            return MAPPER.writeValueAsString(val);
+            return MAPPER.writeValueAsString(value);
         } catch (JsonProcessingException e) {
-            log.error("JSON serialization failed: {}", val, e);
+            log.error("JSON serialization failed: {}", value, e);
             return "{}";
         }
     }
