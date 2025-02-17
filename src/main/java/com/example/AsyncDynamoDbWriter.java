@@ -15,6 +15,8 @@ import software.amazon.awssdk.services.dynamodb.model.*;
 import java.lang.reflect.Field;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -24,6 +26,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 @RequiredArgsConstructor
 public class AsyncDynamoDbWriter {
 
+    private static final int MAX_PARALLEL_REQUESTS = 10; // Adjust based on Lambda memory & DynamoDB limits
+    private final ExecutorService executor = Executors.newFixedThreadPool(MAX_PARALLEL_REQUESTS);
     private static final ObjectMapper objectMapper = new ObjectMapper();
     private final DynamoDbAsyncClient dynamoDbAsyncClient;
     private final String tableName;
@@ -46,26 +50,26 @@ public class AsyncDynamoDbWriter {
             return;
         }
 
-        List<CompletableFuture<UpdateItemResponse>> futures = new ArrayList<>();
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
 
         for (Object model : pendingModels) {
-            CompletableFuture<UpdateItemResponse> future =
-                    doConditionalUpdateAsync(model)
-                            .thenApply(response -> {
-                                successfulWrites.incrementAndGet();
-                                return response;
-                            })
-                            .exceptionally(ex -> {
-                                if (ex.getCause() instanceof ConditionalCheckFailedException) {
-                                    conditionalCheckFailedCount.incrementAndGet();
-                                    log.warn("Conditional update failed.");
-                                } else {
-                                    otherFailedWrites.incrementAndGet();
-                                    log.error("Async update failed: {}", ex.getMessage(), ex);
-                                }
-                                return null;
-                            });
-
+            CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                doConditionalUpdateAsync(model)
+                        .thenApply(response -> {
+                            successfulWrites.incrementAndGet();
+                            return response;
+                        })
+                        .exceptionally(ex -> {
+                            if (ex.getCause() instanceof ConditionalCheckFailedException) {
+                                conditionalCheckFailedCount.incrementAndGet();
+                                log.warn("Conditional update failed.");
+                            } else {
+                                otherFailedWrites.incrementAndGet();
+                                log.error("Async update failed: {}", ex.getMessage(), ex);
+                            }
+                            return null;
+                        });
+            }, executor); // ✅ Uses the defined ExecutorService
             futures.add(future);
         }
 
