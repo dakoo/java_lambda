@@ -41,7 +41,7 @@ public class MainLambdaHandler implements RequestHandler<KafkaEvent, String> {
         } catch (Exception e) {
             String message = "Failed to serialize event to JSON: " + e.getMessage();
             log.error(message);
-            return message;
+            throw new RuntimeException(message);
         }
 
         // 1) Load config from environment
@@ -92,6 +92,9 @@ public class MainLambdaHandler implements RequestHandler<KafkaEvent, String> {
         log.info("  - Successfully Written Records: " + successfulWrites.get() + "\n");
         log.info("  - ConditionalCheckFailedException Records: " + conditionalCheckFailedCount.get() + "\n");
         log.info("  - Other Failed Records: " + otherFailedWrites.get() + "\n");
+        if (otherFailedWrites.get() > 0) {
+            throw new RuntimeException("Failed to process some records");
+        }
         return "completed";
     }
 }
