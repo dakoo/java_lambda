@@ -15,6 +15,8 @@ import software.amazon.awssdk.services.dynamodb.model.*;
 import java.lang.reflect.Field;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -23,17 +25,16 @@ import java.util.concurrent.atomic.AtomicInteger;
 @Slf4j
 @RequiredArgsConstructor
 public class AsyncDynamoDbWriter {
-
     private static final ObjectMapper objectMapper = new ObjectMapper();
     private final DynamoDbAsyncClient dynamoDbAsyncClient;
     private final String tableName;
-
     // ✅ Counters for tracking execution results
     private final AtomicInteger successfulWrites;
     private final AtomicInteger conditionalCheckFailedCount;
     private final AtomicInteger otherFailedWrites;
 
     private final List<Object> pendingModels = new ArrayList<>();
+    private static final ExecutorService executorService = Executors.newFixedThreadPool(100);
 
     public void prepareWrite(Object modelObj) {
         if (modelObj != null) {
@@ -45,28 +46,27 @@ public class AsyncDynamoDbWriter {
         if (pendingModels.isEmpty()) {
             return;
         }
-
-        List<CompletableFuture<UpdateItemResponse>> futures = new ArrayList<>();
+        Collections.shuffle(pendingModels); // ✅ Prevent DynamoDB partition congestion
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
 
         for (Object model : pendingModels) {
-            log.info("Starting async update for model: {}", model);
-            CompletableFuture<UpdateItemResponse> future =
-                    doConditionalUpdateAsync(model)
-                            .thenApply(response -> {
-                                log.info("Completed update for model: {} at {}", model, System.currentTimeMillis());
-                                successfulWrites.incrementAndGet();
-                                return response;
-                            })
-                            .exceptionally(ex -> {
-                                if (ex.getCause() instanceof ConditionalCheckFailedException) {
-                                    conditionalCheckFailedCount.incrementAndGet();
-                                    log.warn("Conditional update failed.");
-                                } else {
-                                    otherFailedWrites.incrementAndGet();
-                                    log.error("Async update failed: {}", ex.getMessage(), ex);
-                                }
-                                return null;
-                            });
+            CompletableFuture<Void> future = CompletableFuture.supplyAsync(() -> {
+                        log.info("send a request for {}", model);
+                        return doConditionalUpdateAsync(model).join();  // ✅ No `runAsync()` batching
+                    }, executorService)
+                    .thenAccept(response -> {
+                        log.info("Completed update for model: {} at {}", model, System.currentTimeMillis());
+                        successfulWrites.incrementAndGet();
+                    }).exceptionally(ex -> {
+                        if (ex.getCause() instanceof ConditionalCheckFailedException) {
+                            conditionalCheckFailedCount.incrementAndGet();
+                            log.warn("Conditional update failed.");
+                        } else {
+                            otherFailedWrites.incrementAndGet();
+                            log.error("Async update failed: {}", ex.getMessage(), ex);
+                        }
+                        return null;
+                    });
 
             futures.add(future);
         }
@@ -89,6 +89,7 @@ public class AsyncDynamoDbWriter {
             }
 
             UpdateItemRequest request = buildUpdateRequest(idVer, expr);
+            log.info("send update request");
             return dynamoDbAsyncClient.updateItem(request);
 
         } catch (NoSuchFieldException | IllegalAccessException ex) {
