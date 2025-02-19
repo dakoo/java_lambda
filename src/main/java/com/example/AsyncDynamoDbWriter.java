@@ -49,9 +49,11 @@ public class AsyncDynamoDbWriter {
         List<CompletableFuture<UpdateItemResponse>> futures = new ArrayList<>();
 
         for (Object model : pendingModels) {
+            log.info("Starting async update for model: {}", model);
             CompletableFuture<UpdateItemResponse> future =
                     doConditionalUpdateAsync(model)
                             .thenApply(response -> {
+                                log.info("Completed update for model: {} at {}", model, System.currentTimeMillis());
                                 successfulWrites.incrementAndGet();
                                 return response;
                             })

@@ -17,7 +17,10 @@ dependencies {
 
     // AWS SDK v2 (Async)
     implementation platform("software.amazon.awssdk:bom:2.20.15")
-    implementation 'software.amazon.awssdk:dynamodb'
+    // AWS SDK v2 for DynamoDB
+    implementation 'software.amazon.awssdk:dynamodb:2.20.121'
+    // AWS SDK v2 - Netty HTTP Client (Required for DynamoDbAsyncClient)
+    implementation 'software.amazon.awssdk:netty-nio-client:2.20.121'
 
     // Jackson for JSON
     implementation 'com.fasterxml.jackson.core:jackson-databind:2.15.0'

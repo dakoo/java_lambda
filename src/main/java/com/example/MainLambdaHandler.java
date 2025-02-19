@@ -21,6 +21,8 @@ public class MainLambdaHandler implements RequestHandler<KafkaEvent, String> {
     private final AtomicInteger conditionalCheckFailedCount = new AtomicInteger();
     private final AtomicInteger otherFailedWrites = new AtomicInteger();
 
+    private final DynamoDbAsyncClient dynamoDbAsyncClient = DynamoDBClientProvider.getClient();
+
     @Override
     public String handleRequest(KafkaEvent event, Context context) {
         // ✅ Reset counters for the new invocation
@@ -57,8 +59,7 @@ public class MainLambdaHandler implements RequestHandler<KafkaEvent, String> {
         log.info("Using parser: {}", config.getParserName());
 
         // 4) Create the DynamoDB async client + writer
-        DynamoDbAsyncClient ddbAsyncClient = DynamoDbAsyncClient.builder().build();
-        AsyncDynamoDbWriter writer = new AsyncDynamoDbWriter(ddbAsyncClient, config.getDynamoDbTableName(),
+        AsyncDynamoDbWriter writer = new AsyncDynamoDbWriter(dynamoDbAsyncClient, config.getDynamoDbTableName(),
                 successfulWrites, conditionalCheckFailedCount, otherFailedWrites);
 
         // 5) For each record, parse + prepare a write (unless DRY_RUN)
