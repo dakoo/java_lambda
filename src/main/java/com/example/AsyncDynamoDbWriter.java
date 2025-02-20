@@ -16,6 +16,7 @@ import java.lang.reflect.Field;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 /**
  * Handles asynchronous writes to DynamoDB.
@@ -73,28 +74,46 @@ public class AsyncDynamoDbWriter {
 
         long parsingAndRequestPrepTime = System.currentTimeMillis();
 
-        List<CompletableFuture<UpdateItemResponse>> futures = new ArrayList<>();
+        List<CompletableFuture<UpdateItemResponse>> futures =
+                updateRequests.parallelStream()
+                        .map(request -> dynamoDbAsyncClient.updateItem(request).thenApply(response -> {
+                                    log.info("Completed update at {}", System.currentTimeMillis());
+                                    successfulWrites.incrementAndGet();
+                                    return response;
+                                })
+                                .exceptionally(ex -> {
+                                    if (ex.getCause() instanceof ConditionalCheckFailedException) {
+                                        conditionalCheckFailedCount.incrementAndGet();
+                                        log.warn("Conditional update failed.");
+                                    } else {
+                                        otherFailedWrites.incrementAndGet();
+                                        log.error("Async update failed: {}", ex.getMessage(), ex);
+                                    }
+                                    return null;
+                                }))
+                        .collect(Collectors.toList());
 
-        for (UpdateItemRequest request : updateRequests) {
-            CompletableFuture<UpdateItemResponse> future = dynamoDbAsyncClient.updateItem(request)
-                            .thenApply(response -> {
-                                log.info("Completed update at {}", System.currentTimeMillis());
-                                successfulWrites.incrementAndGet();
-                                return response;
-                            })
-                            .exceptionally(ex -> {
-                                if (ex.getCause() instanceof ConditionalCheckFailedException) {
-                                    conditionalCheckFailedCount.incrementAndGet();
-                                    log.warn("Conditional update failed.");
-                                } else {
-                                    otherFailedWrites.incrementAndGet();
-                                    log.error("Async update failed: {}", ex.getMessage(), ex);
-                                }
-                                return null;
-                            });
-
-            futures.add(future);
-        }
+//        List<CompletableFuture<UpdateItemResponse>> futures = new ArrayList<>();
+//        for (UpdateItemRequest request : updateRequests) {
+//            CompletableFuture<UpdateItemResponse> future = dynamoDbAsyncClient.updateItem(request)
+//                            .thenApply(response -> {
+//                                log.info("Completed update at {}", System.currentTimeMillis());
+//                                successfulWrites.incrementAndGet();
+//                                return response;
+//                            })
+//                            .exceptionally(ex -> {
+//                                if (ex.getCause() instanceof ConditionalCheckFailedException) {
+//                                    conditionalCheckFailedCount.incrementAndGet();
+//                                    log.warn("Conditional update failed.");
+//                                } else {
+//                                    otherFailedWrites.incrementAndGet();
+//                                    log.error("Async update failed: {}", ex.getMessage(), ex);
+//                                }
+//                                return null;
+//                            });
+//
+//            futures.add(future);
+//        }
         long sendUpdateTime = System.currentTimeMillis();
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
 
