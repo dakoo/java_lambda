@@ -45,15 +45,40 @@ public class AsyncDynamoDbWriter {
         if (pendingModels.isEmpty()) {
             return;
         }
+        long startTime = System.currentTimeMillis();
+
+        List<UpdateItemRequest> updateRequests = new ArrayList<>();
+        for (Object model : pendingModels) {
+            log.info("Starting async update for model: {}", model);
+            try {
+                IdVersionResult idVer = extractIdAndVersion(model);
+                if(idVer == null) {
+                    otherFailedWrites.incrementAndGet();
+                    continue;
+                }
+                ReflectionExpressions expr = buildUpdateAndConditionExpressions(model, idVer.getIncomingVersion(), idVer.getVersionKey(), idVer.getPartitionKey());
+                if(expr == null) {
+                    otherFailedWrites.incrementAndGet();
+                    continue;
+                }
+
+                UpdateItemRequest request = buildUpdateRequest(idVer, expr);
+                updateRequests.add(request);
+
+            } catch (NoSuchFieldException | IllegalAccessException ex) {
+                log.error("Reflection error: {}", ex.getMessage(), ex);
+                otherFailedWrites.incrementAndGet();
+            }
+        }
+
+        long parsingAndRequestPrepTime = System.currentTimeMillis();
 
         List<CompletableFuture<UpdateItemResponse>> futures = new ArrayList<>();
 
-        for (Object model : pendingModels) {
-            log.info("Starting async update for model: {}", model);
-            CompletableFuture<UpdateItemResponse> future =
-                    doConditionalUpdateAsync(model)
+        for (UpdateItemRequest request : updateRequests) {
+            CompletableFuture<UpdateItemResponse> future = dynamoDbAsyncClient.updateItem(request)
                             .thenApply(response -> {
-                                log.info("Completed update for model: {} at {}", model, System.currentTimeMillis());
+                                log.info("Completed update at {}", System.currentTimeMillis());
                                 successfulWrites.incrementAndGet();
                                 return response;
                             })
@@ -70,32 +95,17 @@ public class AsyncDynamoDbWriter {
 
             futures.add(future);
         }
-
+        long sendUpdateTime = System.currentTimeMillis();
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+
+        long updateCompletionTime = System.currentTimeMillis();
         pendingModels.clear();
-    }
 
-    private CompletableFuture<UpdateItemResponse> doConditionalUpdateAsync(Object modelObj) {
-        try {
-            IdVersionResult idVer = extractIdAndVersion(modelObj);
-            if (idVer == null) {
-                otherFailedWrites.incrementAndGet();
-                return CompletableFuture.completedFuture(null);
-            }
-
-            ReflectionExpressions expr = buildUpdateAndConditionExpressions(modelObj, idVer.getIncomingVersion(), idVer.getVersionKey(), idVer.getPartitionKey());
-            if (expr == null) {
-                return CompletableFuture.completedFuture(null);
-            }
-
-            UpdateItemRequest request = buildUpdateRequest(idVer, expr);
-            return dynamoDbAsyncClient.updateItem(request);
-
-        } catch (NoSuchFieldException | IllegalAccessException ex) {
-            log.error("Reflection error: {}", ex.getMessage(), ex);
-            otherFailedWrites.incrementAndGet();
-            return CompletableFuture.completedFuture(null);
-        }
+        // Print execution time details
+        System.out.println("Execution time breakdown:");
+        System.out.println("  Update Requests Prep time: " + (parsingAndRequestPrepTime - startTime) + " ms");
+        System.out.println("  Send Requests time: " + (sendUpdateTime - parsingAndRequestPrepTime) + " ms");
+        System.out.println("  Completion Waiting time: " + (updateCompletionTime - sendUpdateTime) + " ms");
     }
 
     /**
